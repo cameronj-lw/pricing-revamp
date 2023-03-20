@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import os
 import pandas as pd
+import socket
 import sys
 from datetime import date, datetime, timedelta
 from email.utils import parseaddr
@@ -33,7 +34,7 @@ from lw.db.coredb.vsecurity import vSecurityTable
 from lw.db.coredb.vtransaction import vTransactionTable
 from lw.db.mgmtdb.monitor import MonitorTable
 from lw.db.lwdb.apx_appraisal import ApxAppraisalTable
-from lw.util.date import format_time, get_current_bday, get_previous_bday
+from lw.util.date import format_time, get_current_bday, get_previous_bday, get_next_bday
 from lw.util.file import prepare_dated_file_path
 
 
@@ -115,13 +116,13 @@ PRICING_FEEDS = {
 }
 
 APX_SEC_TYPES = {
-    # TODO: confirm if desired
+    # TODO_TO: confirm if desired
     'bond': ['cb', 'cf', 'cm', 'cv', 'fr', 'lb', 'sf', 'tb'],
     'equity': ['cc', 'ce', 'cg', 'ch', 'ci', 'cj', 'ck', 'cn', 'cr', 'cs', 'ct', 'cu', 'ps']
 }
 
 APX_PX_SOURCES = {
-    # 'LWDB source': 'APX source ID'  # APX source name
+    # 'LWDB source': APX source ID   # APX source name
     'DEFAULT'               : 3000,  # LW Not Classified
     'FTSE'                  : 3006,  # LW FTSE TMX
     'FTSETMX_PX'            : 3006,  # LW FTSE TMX
@@ -143,8 +144,11 @@ PRICE_HIERARCHY = RELEVANT_PRICES = [
 ]
 
 
+def NaN_NaT_to_none(df):
+    return df.replace({np.nan: None, pd.NaT: None})
+
 def clean(df):
-    df = df.replace({np.nan: None, pd.NaT: None})
+    df = NaN_NaT_to_none(df)
     res_dict = df.to_dict('records')
     res_str = jsonify(res_dict)
     return res_str
@@ -158,7 +162,7 @@ class MSTeamsMessage(Resource):
 
 def trim_px_sources(raw_prices):
     prices = raw_prices
-    prices['source'] = prices['source'].apply(lambda x: 'BLOOMBERG' if (x[:3] == 'BB_' and '_PX' not in x) else x)
+    prices['source'] = prices['source'].apply(lambda x: 'BLOOMBERG' if (x[:3] == 'BB_' and '_DERIVED' not in x) else x)
     prices['source'] = prices['source'].apply(lambda x: 'FTSE' if x == 'FTSETMX_PX' else x)
     prices['source'] = prices['source'].apply(lambda x: 'FUNDRUN' if x == 'FUNDRUN_EQUITY' else x)
     prices['source'] = prices['source'].apply(lambda x: 'MANUAL' if x == 'FIDESK_MANUALPRICE' else x)
@@ -211,7 +215,6 @@ def is_manual(prices):
     return (len(prices[prices['source']=='MANUAL']) > 0)
 
 def is_missing(prices):
-    # TODO: exclude certain sec types? e.g. lw, mf, cash, prefs, ...
     relevant_external_sources = [x for x in RELEVANT_PRICES if x not in ['MANUAL','MISSING']]
     if len(prices[prices['source'].isin(relevant_external_sources)]):
         return False
@@ -227,31 +230,35 @@ def first2chars(s):
     else:
         return s[:2]
 
+def add_valid_dates(payload):
+    payload['valid_from'] = date.today()
+    payload['valid_to'] = None
+    return payload
+
+def add_asof(payload):
+    logging.info(payload)
+    logging.info(type(payload))
+    if 'asofuser' not in payload:
+        payload['asofuser'] = f"{os.getlogin()}_{socket.gethostname()}"
+    payload['asofdate'] = format_time(datetime.now())
+    return payload
+
 def get_securities_by_sec_type(secs, sec_type=None, sec_type_col='apx_sec_type', sec_type_func=first2chars):
     if sec_type is None:
         return secs
-    if isinstance(sec_type, str):
+    if isinstance(sec_type, str):  # convert to list
         if sec_type in APX_SEC_TYPES:
-            sec_type = APX_SEC_TYPES[sec_type]
-        elif sec_type_func is None:
-            return secs[secs[sec_type_col] == sec_type]
+            sec_type = APX_SEC_TYPES[sec_type]  # should be a list now
         else:
-            processed_sec_types = secs[sec_type_col].apply(sec_type_func)
-            return secs[processed_sec_types == sec_type]
-
+            sec_type = [sec_type]
     if isinstance(sec_type, list):
         if sec_type_func is None:
             return secs[secs[sec_type_col].isin(sec_type)]
         else:
             processed_sec_types = secs[sec_type_col].apply(sec_type_func)
             return secs[processed_sec_types.isin(sec_type)]
-        if sec_type_func is None:
-            return secs[secs[sec_type_col].isin(sec_type)]
-        else:
-            processed_sec_types = secs[sec_type_col].apply(sec_type_func)
-            return secs[processed_sec_types.isin(sec_type)]
 
-def get_held_security_prices(curr_bday, prev_bday, sec_type=None, price_type=None):
+def get_held_securities(curr_bday, sec_type=None):
     curr_bday_appr = ApxAppraisalTable().read_for_date(curr_bday)
     if len(curr_bday_appr):  # if there are Appraisal results for curr day, use it
         secs = vSecurityTable().read()
@@ -261,50 +268,71 @@ def get_held_security_prices(curr_bday, prev_bday, sec_type=None, price_type=Non
     else:  # if not, use live positions
         held = vHeldSecurityTable().read()
         held = get_securities_by_sec_type(held, sec_type)
+    return held
+
+def add_prices(held, i, lw_id, curr_prices, prev_prices):
+    sec_curr_prices = curr_prices.loc[curr_prices['lw_id'] == lw_id]
+    sec_prev_prices = prev_prices.loc[prev_prices['lw_id'] == lw_id]
+    # add prices:
+    prices = pd.concat([sec_curr_prices, sec_prev_prices], ignore_index=True)
+    if len(prices):
+        prices = NaN_NaT_to_none(prices)
+        held.at[i, 'prices'] = prices.to_dict('records')
+        chosen_px = get_chosen_price(prices)
+        if chosen_px is not None:
+            held.at[i, 'chosen_price'] = chosen_px.to_dict('records')
+    return held, prices
+
+def add_audit_trail(held, i, lw_id, curr_audit_trail):
+    sec_curr_audit = curr_audit_trail.loc[curr_audit_trail['lw_id'] == lw_id]
+    if len(sec_curr_audit):
+        sec_curr_audit = NaN_NaT_to_none(sec_curr_audit)
+        held.at[i, 'audit_trail'] = sec_curr_audit.to_dict('records')
+    return held
+
+def should_exclude_sec(lw_id, prices, price_type, manually_priced_secs):
+    if price_type is None:
+        return False
+    if price_type == 'manual':  
+        # securities which have been priced by a user
+        if not is_manual(prices):
+            return True
+    elif price_type == 'missing':  
+        # securities which do not have an external price,
+        # OR are on the "sticky bond" list
+        # TODO_TO: confirm whether desired to include the "sticky bond list" here
+        if not is_missing(prices):
+            if lw_id not in manually_priced_secs['lw_id']:
+                return True
+    elif price_type == 'override':  
+        # securities which have an external price, but were also priced by a user
+        if not is_override(prices):
+            return True
+    # If we made it here, the sec should not be excluded
+    return False
+
+
+def get_held_security_prices(curr_bday, prev_bday, sec_type=None, price_type=None):
+    held = get_held_securities(curr_bday, sec_type)
     held['prices'] = None
     curr_prices = vPriceTable().read(data_date=curr_bday)
     curr_prices = trim_px_sources(curr_prices)
+    # want to include only 1 prev day px: the one from APX
     prev_prices = vPriceTable().read(data_date=prev_bday, source='PXAPX')
     prev_prices['source'] = 'APX'
     curr_audit_trail = PricingAuditTrailTable().read(data_date=curr_bday)
-    manually_priced_secs = get_manual_pricing_securities()
-    logging.info(manually_priced_secs)
+    manually_priced_secs = get_manual_pricing_securities()  # in case we need to add these below
     for i, row in held.iterrows():
         lw_id = row['lw_id']
-        sec_curr_prices = curr_prices.loc[curr_prices['lw_id'] == lw_id]
-        sec_prev_prices = prev_prices.loc[prev_prices['lw_id'] == lw_id]
-        # add prices:
-        prices = pd.concat([sec_curr_prices, sec_prev_prices], ignore_index=True)
-        if len(prices):
-            prices = prices.replace({np.nan: None, pd.NaT: None})
-            held.at[i, 'prices'] = prices.to_dict('records')
-            chosen_px = get_chosen_price(prices)
-            if i < -10:
-                logging.info(type(chosen_px))
-                logging.info(chosen_px)
-            if chosen_px is not None:
-                held.at[i, 'chosen_price'] = chosen_px.to_dict('records')
+        held, prices = add_prices(held, i, lw_id, curr_prices, prev_prices)
         # remove this security according to type, if requested
-        if price_type == 'manual':  # securities which have been priced by a user
-            if not is_manual(prices):
-                held = held.drop(i)
-                continue
-        if price_type == 'missing':  # securities which have been priced by a user
-            # if (~is_missing(prices) and lw_id not in manually_priced_secs['lw_id']):
-            if not is_missing(prices):
-                if lw_id not in manually_priced_secs['lw_id']:
-                    held = held.drop(i)
-                    continue
-        if price_type == 'override':  # securities which have been priced by a user
-            if not is_override(prices):
-                held = held.drop(i)
-                continue
+        if should_exclude_sec(lw_id, prices, price_type, manually_priced_secs):
+            held = held.drop(i)
+            continue
         # add audit trail:
-        sec_curr_audit = curr_audit_trail.loc[curr_audit_trail['lw_id'] == lw_id]
-        if len(sec_curr_audit):
-            sec_curr_audit = sec_curr_audit.replace({np.nan: None, pd.NaT: None})
-            held.at[i, 'audit_trail'] = sec_curr_audit.to_dict('records')
-    # TODO: add "good_thru_date" in top level output (incl holiday logic for wave 2)
+        held = add_audit_trail(held, i, lw_id, curr_audit_trail)
+    # TODO_WAVE2: make good thru date based on sec type / applicable holiday calendar
+    held['good_thru_date'] = get_next_bday(curr_bday)
     return clean(held)
 
 
@@ -404,7 +432,6 @@ def save_binary_files(data_date, files):
 
 @api.route('/api/pricing/attachment/<string:price_date>')
 class PricingAttachmentByDate(Resource):
-    # TODO_WAVE1: create POST to take array of binary file contents and file names and save in folder
     def post(self, price_date):
         payload = api.payload
         if 'files' not in payload:
@@ -423,8 +450,6 @@ class PricingAttachmentByDate(Resource):
                 files.append(os.path.join(full_path, entry))
         return files
 
-
-
 @api.route('/api/zTEST/pricing-attachment-file-path/<string:lw_id>')
 class PricingAttachmentFilePathForLWID(Resource):
     def get(self, lw_id):
@@ -433,7 +458,7 @@ class PricingAttachmentFilePathForLWID(Resource):
         return os.path.join(full_path, lw_id)
 
 def valid(df, data_date=date.today()):  
-# TODO: put into library; put function header; write unit tests?
+# TODO: does this belong in a library?
     valid_from = [
         pd.isnull(df['valid_from']), df['valid_from'] <= np.datetime64(data_date)
     ]
@@ -449,7 +474,7 @@ class PricingAuditReason(Resource):
         valid_reasons = valid(reasons)[['reason']]
         return clean(valid_reasons)
 
-class PricingNotificationSubscriptionSchema(Schema):  # TODO: delete when confirmed not needed
+class PricingNotificationSubscriptionSchema(Schema):  # TODO: remove when not needed
     email = fields.Email(required=True)
     feed_name = fields.Str(required=True)
     email_on_pending = fields.Bool(load_default=True, dump_default=True)
@@ -477,11 +502,8 @@ class PricingNotificationSubscription(Resource):
         email = parseaddr(payload['email'])[1]
         if email == '':
             return 'invalid email: ', 422
-        payload['valid_from'] = date.today()
-        payload['valid_to'] = None
-        if 'asofuser' not in payload:
-            payload['asofuser'] = 'CJ'  # TODO: replace with actual user and/or hostname
-        payload['asofdate'] = format_time(datetime.now())
+        payload = add_valid_dates(payload)
+        payload = add_asof(payload)
         PricingNotificationSubscriptionTable().bulk_insert(pd.DataFrame([payload]))
     
     def get(self):
@@ -590,81 +612,51 @@ def is_pending(pf, data_date):
 #         self.data_date = data_date
 #         self.status = None
 
+def get_pricing_feed_status(price_date=date.today()):
+    statuses = {}
+    try:
+        for pf in PRICING_FEEDS:
+            error = is_error(pf, price_date)
+            if error[0]:
+                statuses[pf] = {'status': 'ERROR', 'asofdate': error[1].isoformat()}
+                continue
+            priced = is_priced(pf, price_date)
+            if priced[0]:
+                statuses[pf] = {'status': 'PRICED', 'asofdate': priced[1].isoformat()}
+                continue
+            in_progress = is_in_progress(pf, price_date)
+            if in_progress[0]:
+                statuses[pf] = {'status': 'IN PROGRESS', 'asofdate': in_progress[1].isoformat()}
+                continue
+            delayed = is_delayed(pf, price_date)
+            if delayed[0]:
+                statuses[pf] = {'status': 'DELAYED', 'asofdate': delayed[1].isoformat()}
+                continue
+            pending = is_pending(pf, price_date)
+            if pending[0]:
+                statuses[pf] = {'status': 'PENDING', 'asofdate': pending[1].isoformat()}
+                continue
+        for s in statuses:
+            statuses[s]['normal_eta'] = PRICING_FEEDS[s]['normal_eta'].isoformat()
+        return statuses
+    except exc.SQLAlchemyError as err:  # TODO: return code based on what the error is
+        logging.info(err.code, err)
+        return None
+
 @api.route('/api/pricing/feed-status')
 class PricingFeedStatus(Resource):
-    def get(self):  
-        # TODO: refactor? Share logic with below endpoint. Maybe create a PricingFeed class w subclasses for each feed
-        data_date = date.today()
-        statuses = {}
-        try:
-            for pf in PRICING_FEEDS:
-                error = is_error(pf, data_date)
-                if error[0]:
-                    statuses[pf] = {'status': 'ERROR', 'asofdate': error[1].isoformat()}
-                    continue
-                priced = is_priced(pf, data_date)
-                if priced[0]:
-                    statuses[pf] = {'status': 'PRICED', 'asofdate': priced[1].isoformat()}
-                    continue
-                in_progress = is_in_progress(pf, data_date)
-                if in_progress[0]:
-                    statuses[pf] = {'status': 'IN PROGRESS', 'asofdate': in_progress[1].isoformat()}
-                    continue
-                delayed = is_delayed(pf, data_date)
-                if delayed[0]:
-                    statuses[pf] = {'status': 'DELAYED', 'asofdate': delayed[1].isoformat()}
-                    continue
-                pending = is_pending(pf, data_date)
-                if pending[0]:
-                    statuses[pf] = {'status': 'PENDING', 'asofdate': pending[1].isoformat()}
-                    continue
-            for s in statuses:
-                statuses[s]['normal_eta'] = PRICING_FEEDS[s]['normal_eta'].isoformat()
-            return statuses
-        except exc.SQLAlchemyError as err:  # TODO: return code based on what the error is
-            logging.info(err.code, err)
-            return None
+    def get(self):
+        return get_pricing_feed_status()
             
 @api.route('/api/pricing/feed-status/<string:price_date>')
 class PricingFeedStatusByDate(Resource):
     def get(self, price_date):
-        statuses = {}
-        try:
-            for pf in PRICING_FEEDS:
-                error = is_error(pf, price_date)
-                if error[0]:
-                    statuses[pf] = {'status': 'ERROR', 'asofdate': error[1].isoformat()}
-                    continue
-                priced = is_priced(pf, price_date)
-                if priced[0]:
-                    statuses[pf] = {'status': 'PRICED', 'asofdate': priced[1].isoformat()}
-                    continue
-                in_progress = is_in_progress(pf, price_date)
-                if in_progress[0]:
-                    statuses[pf] = {'status': 'IN PROGRESS', 'asofdate': in_progress[1].isoformat()}
-                    continue
-                delayed = is_delayed(pf, price_date)
-                if delayed[0]:
-                    statuses[pf] = {'status': 'DELAYED', 'asofdate': delayed[1].isoformat()}
-                    continue
-                pending = is_pending(pf, price_date)
-                if pending[0]:
-                    statuses[pf] = {'status': 'PENDING', 'asofdate': pending[1].isoformat()}
-                    continue
-            for s in statuses:
-                statuses[s]['normal_eta'] = PRICING_FEEDS[s]['normal_eta'].isoformat()
-            return statuses
-        except exc.SQLAlchemyError as err:  # TODO: return code based on what the error is
-            logging.info(err.code, err)
-            return None
-            
-        # BEGIN old code ... TODO: remove this once confirmed not needed
+        return get_pricing_feed_status(price_date)           
+        # BEGIN old code ... TODO: when not needed
         # for col in mon:
         #     if pd.api.types.is_datetime64_any_dtype(mon[col]):
         #         # when date value is null, it comes out as NaT which Flask cannot encode into JSON
-        #         # TODO: better way of handling this... maybe run every resultset through a generic "clean" function
         #         mon[col] = mon[col].replace([pd.NaT], None)
-        # # TODO: trim resultset to only rows/cols relevant for pricing feeds
         # return mon.to_dict('records')
         # END old code
 
@@ -678,6 +670,7 @@ def price_file_name(from_date):
     return f"{name}.pri"
 
 def prices_to_tab_delim_files(prices):
+    # TODO: consider making this query APX prices, and only include prices which are changes
     base_path = os.path.join(config.DATA_DIR, 'lw', 'pricing')
     today_folder = prepare_dated_file_path(folder_name=base_path, date=date.today(), file_name='', rotate=False)
     files = []
@@ -832,12 +825,12 @@ class HeldSecurityWithPricesByDateAndType(Resource):
         curr_bday, prev_bday = get_current_bday(datetime.strptime(price_date, '%Y%m%d')), get_previous_bday(datetime.strptime(price_date, '%Y%m%d'))
         return get_held_security_prices(curr_bday, prev_bday, price_type)
 
-@api.route('/api/zIN-PROGRESS/pricing/table-capture/<string:price_date>/<string:email>')  # TODO: actually implement
+@api.route('/api/zIN-PROGRESS/pricing/table-capture/<string:price_date>/<string:email>')  # TODO_WAVE3: actually implement
 class PricingTableCaptureByDate(Resource):
     def post(self, price_date, email):        
         return "{\"noteyet\": \"implemented\"}", 200
 
-@api.route('/api/zIN-PROGRESS/holiday/<string:data_date>')  # TODO: actually implement
+@api.route('/api/zIN-PROGRESS/holiday/<string:data_date>')  # TODO_WAVE2: actually implement
 class HolidayByDate(Resource):
     def get(self, data_date):
         return "{\"noteyet\": \"implemented\"}", 200
@@ -863,12 +856,9 @@ class ManualPricingSecurity(Resource):
                 'data': payload,
                 'message': f"lw_id must be an array"
             }, 422
+        payload = add_valid_dates(payload)
+        payload = add_asof(payload)
         secs = pd.DataFrame.from_dict(payload)
-        secs['valid_from'] = date.today()
-        secs['valid_to'] = None
-        if 'asofuser' not in secs:
-            secs['asofuser'] = 'CJ'  # TODO: replace with actual user and/or hostname
-        secs['asofdate'] = format_time(datetime.now())
         PricingManualPricingSecurityTable().bulk_insert(secs)
     
     # def post_old(self):
@@ -916,9 +906,7 @@ class PricingAuditTrail(Resource):
                     'message': f"required field(s) missing"
                 }, 422
             # passed all QA for this row! Add it to the df
-            if 'asofuser' not in at:
-                at['asofuser'] = 'CJ'  # TODO: replace with actual user and/or hostname
-            at['asofdate'] = format_time(datetime.now())
+            at = add_asof(at)
             at['data_dt'] = price_date
             if res_audit_trail is None:
                 res_audit_trail = pd.DataFrame([at])
@@ -962,9 +950,7 @@ class PricingColumnConfig(Resource):
                     'message': f"required field(s) missing"
                 }, 422
             # passed all QA for this row! Add it to the df
-            if 'asofuser' not in c:
-                c['asofuser'] = 'CJ'  # TODO: replace with actual user and/or hostname
-            c['asofdate'] = format_time(datetime.now())
+            c = add_asof(c)
             c['user_id'] = user_id
             if res_col_config is None:
                 res_col_config = pd.DataFrame([c])
