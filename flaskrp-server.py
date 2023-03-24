@@ -8,6 +8,7 @@ import socket
 import sys
 from datetime import date, datetime, timedelta
 from email.utils import parseaddr
+from email_validator import validate_email, EmailNotValidError
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_marshmallow import Marshmallow
@@ -151,10 +152,25 @@ PRICE_HIERARCHY = RELEVANT_PRICES = [
 ]
 
 
-def NaN_NaT_to_none(df):
+# TODO_REFACTOR: move API supporting functions to outside of main API driver file
+
+
+def NaN_NaT_to_none(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replaces NaN and NaT values in the provided DataFrame with None.
+    """
     return df.replace({np.nan: None, pd.NaT: None})
 
-def clean(df):
+def clean(df: pd.DataFrame) -> str:
+    """
+    Cleans and formats a DataFrame and returns the results as a JSON string.
+    
+    Args:
+    - df (DataFrame): The DataFrame to clean and format.
+    
+    Returns:
+    - str: A JSON string containing the cleaned and formatted DataFrame, along with a status and message.
+    """
     if len(df.index):
         df = NaN_NaT_to_none(df)
         data_dict = df.to_dict('records')
@@ -172,7 +188,16 @@ def clean(df):
     res_str = jsonify(res_dict)
     return res_str
 
-def trim_px_sources(raw_prices):
+def trim_px_sources(raw_prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Trims the sources in a DataFrame of prices based on a set of predetermined rules and returns the result.
+    
+    Args:
+    - raw_prices (DataFrame): The DataFrame of raw prices to process.
+    
+    Returns:
+    - DataFrame: The processed DataFrame with sources trimmed according to the rules.
+    """
     prices = raw_prices
     prices['source'] = prices['source'].apply(lambda x: 'BLOOMBERG' if (x[:3] == 'BB_' and '_DERIVED' not in x) else x)
     prices['source'] = prices['source'].apply(lambda x: 'FTSE' if x == 'FTSETMX_PX' else x)
@@ -182,18 +207,20 @@ def trim_px_sources(raw_prices):
     prices = prices[prices['source'].isin(RELEVANT_PRICES)]
     return prices
 
-@api.route('/api/pricing/price/<string:price_date>')
-class PriceByDate(Resource):
-    def get(self, price_date):
-        prices = vPriceTable().read_for_date(data_date=price_date)
-        prices = trim_px_sources(prices)
-        return clean(prices)
-
-def get_chosen_price(prices):
+def get_chosen_price(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns the preferred price for a set of prices based on the predetermined hierarchy.
+    
+    Args:
+    - prices (DataFrame): The DataFrame of prices to process.
+    
+    Returns:
+    - DataFrame: The preferred price as a DataFrame with a single row.
+    """
     chosen_loc = chosen_px = None
     for i, px in prices.iterrows():
         src = px['source']
-        # logging.info(f"{src} for {px['lw_id']}")
+        logging.debug(f"{src} for {px['lw_id']}")
         if src not in PRICE_HIERARCHY:
             continue
         elif chosen_loc is None:
@@ -204,39 +231,110 @@ def get_chosen_price(prices):
             chosen_px = prices.loc[[i]]
     if chosen_px is None:
         return chosen_px
-    return chosen_px#.to_frame()
+    return chosen_px
 
 def is_manual(prices):
+    """
+    Determines if the security with the prices provided in the DataFrame was manually priced.
+    A manual price is any price manually inputted by a user (as opposed to from an external source).
+    
+    Args:
+    - prices: A DataFrame of prices for a single security on a single date.
+    
+    Returns:
+    - A boolean value indicating whether the security with the prices provided in the DataFrame 
+        was manually priced.
+    """
     return (len(prices[prices['source']=='MANUAL']) > 0)
 
+
 def is_missing(prices):
+    """
+    Determines if the security with the prices provided in the DataFrame is a security missing price.
+    A security missing price is one for which we have not yet recieved an external price.
+    
+    Args:
+    - prices: A DataFrame of prices for a single security on a single date.
+    
+    Returns:
+    - A boolean value indicating whether the security with the prices provided in the DataFrame
+        is a security missing price.
+    """
     relevant_external_sources = [x for x in RELEVANT_PRICES if x not in ['MANUAL','MISSING']]
     if len(prices[prices['source'].isin(relevant_external_sources)]):
         return False
     else:
         return True
 
+
 def is_override(prices):
+    """
+    Determines if the security with the prices provided in the DataFrame has an overridden price.
+    An overridden price is a manual price (see above) which occurred despite having an external price.
+    
+    Args:
+    - prices: A DataFrame of prices for a single security on a single date.
+    
+    Returns:
+    - A boolean value indicating whether the security with the prices provided in the DataFrame
+        has an overridden price.
+    """
     return (~is_missing(prices) and is_manual(prices))
 
+
 def first2chars(s):
+    """
+    Returns the first two characters of the provided string.
+    """
     if s is None:
         return s
     else:
         return s[:2]
 
+
 def add_valid_dates(payload):
+    """
+    Adds valid_from and valid_to fields to a dictionary or DataFrame.
+    
+    Args:
+    - payload: A dictionary or DataFrame.
+    
+    Returns:
+    - The input dictionary or DataFrame with valid_from and valid_to fields added.
+    """
     payload['valid_from'] = date.today()
     payload['valid_to'] = None
     return payload
 
+
 def add_asof(payload):
+    """
+    Adds asofdate and asofuser fields to a dictionary or DataFrame.
+    
+    Args:
+    - payload: A dictionary or DataFrame.
+    
+    Returns:
+    - The input dictionary or DataFrame with asofdate and asofuser fields added.
+    """
     if 'asofuser' not in payload:
         payload['asofuser'] = f"{os.getlogin()}_{socket.gethostname()}"
     payload['asofdate'] = format_time(datetime.now())
     return payload
 
 def get_securities_by_sec_type(secs, sec_type=None, sec_type_col='apx_sec_type', sec_type_func=first2chars):
+    """
+    Filters securities DataFrame by security type.
+
+    Args:
+    - secs (DataFrame): DataFrame containing securities.
+    - sec_type (str or list, optional): Security type(s) to filter by. If not provided, do not filter.
+    - sec_type_col (str, optional): Column name in 'secs' DataFrame containing security type information.
+    - sec_type_func (function, optional): Function used to transform security types for filtering.
+
+    Returns:
+    - DataFrame: Filtered 'secs' DataFrame.
+    """
     if sec_type is None:
         return secs
     if isinstance(sec_type, str):  # convert to list
@@ -252,6 +350,16 @@ def get_securities_by_sec_type(secs, sec_type=None, sec_type_col='apx_sec_type',
             return secs[processed_sec_types.isin(sec_type)]
 
 def get_held_securities(curr_bday, sec_type=None):
+    """
+    Retrieves held securities for a given date, optionally filtering by security type.
+
+    Args:
+    - curr_bday (str): Date to retrieve held securities for (in YYYYMMDD format).
+    - sec_type (str or list, optional): Security type(s) to filter by.
+
+    Returns:
+    - DataFrame: Held securities DataFrame.
+    """
     curr_bday_appr = ApxAppraisalTable().read_for_date(curr_bday)
     if len(curr_bday_appr):  # if there are Appraisal results for curr day, use it
         secs = vSecurityTable().read()
@@ -264,6 +372,20 @@ def get_held_securities(curr_bday, sec_type=None):
     return held
 
 def add_prices(held, i, lw_id, curr_prices, prev_prices):
+    """
+    Add price information to a held security row.
+
+    Args:
+    - held (DataFrame): DataFrame containing held securities.
+    - i (int): Index of the row to add prices to.
+    - lw_id (str): lw_id of the security to add prices for.
+    - curr_prices (DataFrame): DataFrame containing current bday prices.
+    - prev_prices (DataFrame): DataFrame containing previous bday prices.
+
+    Returns:
+    - DataFrame: Modified 'held' DataFrame containing prices.
+    - DataFrame: Combined provided prices for current bday and previous bday.
+    """
     sec_curr_prices = curr_prices.loc[curr_prices['lw_id'] == lw_id]
     sec_prev_prices = prev_prices.loc[prev_prices['lw_id'] == lw_id]
     # add prices:
@@ -277,6 +399,18 @@ def add_prices(held, i, lw_id, curr_prices, prev_prices):
     return held, prices
 
 def add_audit_trail(held, i, lw_id, curr_audit_trail):
+    """
+    Add audit trail information to a held security row.
+
+    Args:
+    - held (DataFrame): DataFrame containing held securities.
+    - i (int): Index of the row to add audit trail information to.
+    - lw_id (str): lw_id of the security to add audit trail information for.
+    - curr_audit_trail (DataFrame): DataFrame containing audit trail information.
+
+    Returns:
+    - DataFrame: Modified 'held' DataFrame containing audit trail.
+    """
     sec_curr_audit = curr_audit_trail.loc[curr_audit_trail['lw_id'] == lw_id]
     if len(sec_curr_audit):
         sec_curr_audit = NaN_NaT_to_none(sec_curr_audit)
@@ -287,6 +421,19 @@ def add_audit_trail(held, i, lw_id, curr_audit_trail):
     return held
 
 def should_exclude_sec(lw_id, prices, price_type, manually_priced_secs):
+    """
+    Determine whether a security should be excluded based on pricing information.
+
+    Args:
+    - lw_id (str): lw_id of the security to check.
+    - prices (DataFrame): DataFrame containing prices for the given security on a single date.
+    - price_type (str or None): Type of pricing information to check for (e.g. 'manual', 'missing', 'override').
+    - manually_priced_secs (DataFrame): DataFrame containing securities which should always be manually priced,
+        even when we have an external price.
+
+    Returns:
+    - bool: Whether the security should be excluded.
+    """
     if price_type is None:
         return False
     if price_type == 'manual':  
@@ -309,6 +456,19 @@ def should_exclude_sec(lw_id, prices, price_type, manually_priced_secs):
 
 
 def get_held_security_prices(curr_bday, prev_bday, sec_type=None, price_type=None):
+    """
+    Retrieve held securities with price and audit trail information for the provided
+    current and previous business days, optionally filtered by security type and/or price type.
+
+    Args:
+    - curr_bday (str): Date to retrieve held securities for (in YYYYMMDD format).
+    - prev_bday (str): Previous date to retrieve price for (in YYYYMMDD format).
+    - sec_type (str or list, optional): Security type(s) to filter by.
+    - price_type (str or None, optional): Type of pricing information to filter by (e.g. 'manual', 'missing', 'override').
+
+    Returns:
+    - JSON string of held securities with price and audit trail information, along with status and message if applicable.
+    """
     held = get_held_securities(curr_bday, sec_type)
     held['prices'] = None
     curr_prices = vPriceTable().read(data_date=curr_bday)
@@ -331,58 +491,35 @@ def get_held_security_prices(curr_bday, prev_bday, sec_type=None, price_type=Non
     held['good_thru_date'] = get_next_bday(curr_bday)
     return clean(held)
 
-
-@api.route('/api/pricing/held-security-price')
-class HeldSecurityWithPrices(Resource):
-    def post(self):
-        # Note this is not really a standard "post" as it does not save data - but is created as such 
-        # because we want to accept optional params in the payload rather than the URL, and 
-        # some clients such as AngularJS cannot do so for a GET request.
-        payload = api.payload
-        if 'sec_type' in payload:
-            sec_type = payload['sec_type']
-        else:
-            sec_type = None
-        if 'price_date' in payload:
-            price_date = payload['price_date']
-        else:
-            price_date = date.today()
-        if 'price_type' in payload:
-            price_type = payload['price_type']
-        else:
-            price_type = None
-        curr_bday, prev_bday = get_current_bday(price_date), get_previous_bday(price_date)
-        # logging.info(request.json)
-        # payload = api.payload
-        # if 'price_type' in payload:
-        #     return get_held_security_prices(curr_bday, prev_bday, payload['price_type'])
-        return get_held_security_prices(curr_bday, prev_bday, sec_type, price_type)
-
 def get_pricing_attachment_folder(data_date):
-        base_path = os.path.join(config.DATA_DIR, 'lw', 'pricing_audit')
-        full_path = prepare_dated_file_path(folder_name=base_path, date=datetime.strptime(data_date, '%Y%m%d'), file_name='', rotate=False)
-        return full_path
+    """
+    Retrieves the path to the folder containing pricing attachments for a given date.
+
+    Args:
+    - data_date (str): Date to retrieve attachment folder for (in YYYYMMDD format).
+
+    Returns:
+    - str: The path to the folder containing pricing attachments for the given date.
+    """
+    base_path = os.path.join(config.DATA_DIR, 'lw', 'pricing_audit')
+    full_path = prepare_dated_file_path(folder_name=base_path, date=datetime.strptime(data_date, '%Y%m%d'), file_name='', rotate=False)
+    return full_path
 
 def save_binary_files(data_date, files):
     """
-    Save binary files to folder corresponding to data_date.
+    Saves binary files to the folder corresponding to data_date.
 
     Args:
-        folder_path (str): The path of the folder where the files will be saved.
-        files (list): A list of dictionaries where each dictionary contains
-                      the filename and its binary contents.
+    - data_date (str): Date for folder where the files will be saved.
+    - files (list): A list of dictionaries where each contains the filename and its binary contents.
 
     Returns:
-        None
+    - Standard result (status/data/message) and HTTP return code
     """
 
     # Create the folder if it doesn't exist
     folder_path = get_pricing_attachment_folder(data_date)
-    if os.path.exists(folder_path):
-        delete_res = delete_dir_contents(folder_path)
-        if delete_res[1] != 200:
-            return delete_res
-    else:
+    if not os.path.exists(folder_path):
         os.makedirs(folder_path)
 
     # Save each file in the list
@@ -410,6 +547,16 @@ def save_binary_files(data_date, files):
         }, 200
 
 def delete_dir_contents(path):
+    """
+    Deletes all files in a given directory.
+
+    Args:
+    - path (str): The path to the directory whose contents should be deleted.
+
+    Returns:
+    - dict: Standard response (status/data/message).
+    - int: HTTP return code which would be appropriate given the result of the operation.
+    """
     try:
         files = os.listdir(path)
         for f in files:
@@ -417,7 +564,7 @@ def delete_dir_contents(path):
         return {
             'status': 'success',
             'data': None,
-            'message': f'deleted {len(files)} files from {path}'
+            'message': f'Deleted {len(files)} files from {path}'
         }, 200
     except Exception as e:
         msg = f'Failed to delete files at {path}: {e}'
@@ -428,33 +575,20 @@ def delete_dir_contents(path):
             'message': msg
         }, 500
 
-@api.route('/api/pricing/attachment/<string:price_date>')
-class PricingAttachmentByDate(Resource):
-    def post(self, price_date):
-        payload = api.payload
-        if 'files' not in payload:
-            return {
-                'status': 'error',
-                'data': payload,
-                'message': f"payload must contain files"
-            }, 422
-        else:
-            return save_binary_files(price_date, payload['files'])
-    
-    def get(self, price_date):
-        full_path = get_pricing_attachment_folder(price_date)
-        files = []
-        with os.listdir(full_path) as entries:
-            for entry in entries:
-                files.append(os.path.join(full_path, entry))
-        return clean(pd.DataFrame(files, columns=['full_path']))
-
-    def delete(self, price_date):
-        full_path = get_pricing_attachment_folder(price_date)
-        return delete_dir_contents(full_path)
-
 def valid(df, data_date=date.today()):  
-# TODO_REFACTOR: does this belong in a library?
+    """
+    Filters a pandas dataframe to include only rows whose 'valid_from' and 'valid_to' date ranges
+    include the specified date, or are null.
+
+    Args:
+    - df (pandas.DataFrame): The dataframe to be filtered.
+    - data_date (datetime.date): The date to be used for the filtering.
+
+    Returns:
+    - pandas.DataFrame: A new dataframe containing only rows whose 'valid_from' and 'valid_to' date ranges
+                        include the specified date, or are null.
+    """
+    # TODO_REFACTOR: does this belong in a library?
     valid_from = [
         pd.isnull(df['valid_from']), df['valid_from'] <= np.datetime64(data_date)
     ]
@@ -463,14 +597,18 @@ def valid(df, data_date=date.today()):
     ]
     return df.loc[valid_from[0] | valid_from[1]].loc[valid_to[0] | valid_to[1]]
 
-@api.route('/api/pricing/audit-reason')
-class PricingAuditReason(Resource):
-    def get(self):
-        reasons = PricingAuditReasonTable().read()
-        valid_reasons = valid(reasons)[['reason']]
-        return clean(valid_reasons)
-
 def save_df_to_table(df, table):
+    """
+    Saves a pandas dataframe to a database table using the specified table object's bulk_insert method.
+
+    Args:
+    - df (pandas.DataFrame): The dataframe to be saved.
+    - table (subclass of table.BaseTable or table.ScenarioTable): The database table object to save the dataframe to.
+
+    Returns:
+    - dict: Standard response (status/data/message).
+    - int: HTTP return code which would be appropriate given the result of the operation.
+    """
     try:
         res = table.bulk_insert(df)
         if res.rowcount == len(df.index):
@@ -498,89 +636,18 @@ def save_df_to_table(df, table):
             'message': f'SQLAlchemy error: {e}'
         }, 500
 
-@api.route('/api/pricing/notification-subscription')
-class PricingNotificationSubscription(Resource):
-    def post(self):
-        payload = api.payload
-        # TODO_CLEANUP: remove below when not needed
-        # below using marshmallow ... may continue trying this if flask_marshmallow isn't sufficient
-        # try:
-        #     data = PricingNotificationSubscriptionSchema().load(payload)
-        # except ValidationError as err:
-        #     return err.messages, 422
-        if 'email' not in payload or 'feed_name' not in payload:
-            return {
-                'status': 'error',
-                'data': None,
-                'message': f'required field(s) missing: email, feed_name'
-            }, 422
-        email = parseaddr(payload['email'])[1]
-        if email == '':
-            return {
-                'status': 'error',
-                'data': None,
-                'message': f"invalid email: {payload['email']}"
-            }, 422
-        old_rows = self.set_valid_to_yesterday(email, payload['feed_name'])
-        payload = add_valid_dates(payload)
-        payload = add_asof(payload)
-        return save_df_to_table(pd.DataFrame([payload]), PricingNotificationSubscriptionTable())
-    
-    def get(self):
-        subs = PricingNotificationSubscriptionTable().read()
-        valid_subs = valid(subs)[['email','feed_name','email_on_pending','email_on_in_progress','email_on_complete','email_on_error','email_on_delayed']]
-        return clean(valid_subs)
-
-    def delete(self):
-        payload = api.payload
-        if 'email' not in payload or 'feed_name' not in payload:
-            return {
-                'status': 'error',
-                'data': None,
-                'message': f'required field(s) missing: email, feed_name'
-            }, 422
-        email = parseaddr(payload['email'])[1]
-        if email == '':
-            return {
-                'status': 'error',
-                'data': None,
-                'message': f"invalid email: {payload['email']}"
-            }, 422
-        updated_rows = self.set_valid_to_yesterday(email, payload['feed_name'])
-        if updated_rows:
-            return {
-                'status': 'success',
-                'message': f"deleted {updated_rows} subscription(s) for {email} {payload['feed_name']}"
-            }, 200
-        else:
-            return {
-                'status': 'warning',
-                'data': None,
-                'message': f"Found nothing to delete for {email} {payload['feed_name']}"
-            }, 200
-
-    def set_valid_to_yesterday(self, email, feed_name):
-        pns_table = PricingNotificationSubscriptionTable()
-        new_vals = {'valid_to': date.today() + timedelta(days=-1)}
-        new_vals = add_asof(new_vals)
-        stmt = update(pns_table.table_def).\
-						where(pns_table.table_def.c.email == email).\
-						where(pns_table.table_def.c.feed_name == feed_name).\
-						where(pns_table.table_def.c.valid_to == None).\
-						values(new_vals)
-        updated_rows = pns_table._database.execute_write(stmt).rowcount
-        logging.info(
-            f"{pns_table.table_name}: Updated valid_to for {updated_rows} rows for {email} {feed_name}."
-        )
-        return updated_rows
-    
-@api.route('/api/transaction/<string:trade_date>')
-class TransactionByDate(Resource):
-    def get(self, trade_date):
-        txns = vTransactionTable().read_for_trade_date(trade_date=trade_date)
-        return clean(txns)
-
 def is_error(pf, data_date):
+    """
+    Determines if a given pricing feed is in an error state for a given date.
+
+    Args:
+    - pf (str): The name of the pricing feed to check.
+    - data_date (datetime.date): The date to check for.
+
+    Returns:
+    - tuple: A tuple containing a boolean indicating whether or not an error state was detected, and a datetime
+            indicating the maximum timestamp of the error (or the current datetime if no error was detected).
+    """
     res, max_ts = False, datetime.fromordinal(1)  # beginning of time
     for task in PRICING_FEEDS[pf]:
         if not isinstance(PRICING_FEEDS[pf][task], list):
@@ -595,6 +662,18 @@ def is_error(pf, data_date):
     return res, (max_ts if res else datetime.now())
 
 def is_priced(pf, data_date):
+    """
+    Determines if a given pricing feed has been successfully priced for a given date.
+
+    Args:
+    - pf (str): The name of the pricing feed to check.
+    - data_date (datetime.date): The date to check for.
+
+    Returns:
+    - tuple: A tuple containing a boolean indicating whether or not successful pricing was detected, and a datetime
+            indicating the maximum timestamp of the pricing completion (or the current datetime if no successful pricing
+            was detected).
+    """
     max_ts = datetime.fromordinal(1)  # beginning of time
     if 'LOAD2PRICING' in PRICING_FEEDS[pf]:
         for (rg, rns) in PRICING_FEEDS[pf]['LOAD2PRICING']:
@@ -608,6 +687,18 @@ def is_priced(pf, data_date):
     return False, datetime.now()
 
 def is_in_progress(pf, data_date):
+    """
+    Determines if a given pricing feed is currently in progress for a given date.
+
+    Args:
+    - pf (str): The name of the pricing feed to check.
+    - data_date (datetime.date): The date to check for.
+
+    Returns:
+    - tuple: A tuple containing a boolean indicating whether or not pricing is currently in progress, and a datetime
+            indicating the maximum timestamp of the in-progress state (or the current datetime if no in-progress state
+            was detected).
+    """
     res, max_ts = False, datetime.fromordinal(1)  # beginning of time
     for task in ['BB_SNAP', 'FTP_DOWNLOAD', 'LOAD2LW', 'LOAD2PRICING']:
         if task in PRICING_FEEDS[pf]:
@@ -621,6 +712,18 @@ def is_in_progress(pf, data_date):
     return res, (max_ts if res else datetime.now())
 
 def is_delayed(pf, data_date):
+    """
+    Determines if a given pricing feed is delayed for a given date.
+
+    Args:
+    - pf (str): The name of the pricing feed to check.
+    - data_date (datetime.date): The date to check for.
+
+    Returns:
+    - tuple: A tuple containing a boolean indicating whether or not a delay was detected, and a datetime
+            indicating the current datetime (since this function only checks if a delay is present, it is always
+            called at the time of the delay, so the current datetime is used to indicate the time of the delay).
+    """ 
     if is_priced(pf, data_date)[0]:
         return False, datetime.now()
     if 'normal_eta' in PRICING_FEEDS[pf]:
@@ -629,6 +732,17 @@ def is_delayed(pf, data_date):
     return False, datetime.now()
 
 def is_pending(pf, data_date):
+    """
+    Determines if a given pricing feed is pending for a given date.
+
+    Args:
+    - pf (str): The name of the pricing feed to check.
+    - data_date (datetime.date): The data date to check for.
+
+    Returns:
+    - tuple: A tuple with a boolean value indicating whether the pricing feed is pending, and a datetime 
+            representing the timestamp of when the FTP Upload completed.
+    """
     max_ts = datetime.fromordinal(1)  # beginning of time
     if 'FTP_UPLOAD' in PRICING_FEEDS[pf]:
         for (rg, rns) in PRICING_FEEDS[pf]['FTP_UPLOAD']:
@@ -647,6 +761,16 @@ def is_pending(pf, data_date):
 #         self.status = None
 
 def get_pricing_feed_status(price_date=date.today()):
+    """
+    Retrieves the pricing feed status for the given price date.
+
+    Args:
+    - price_date (optional): The price date to check for. Defaults to today's date.
+
+    Returns:
+    - Tuple: A tuple with a standard response dictionary (status/data/message) containing 
+            pricing feed statuses, and an appropriate HTTP status code given the result of the operation.
+    """
     statuses = {}
     pd = datetime.strptime(price_date, '%Y%m%d') if isinstance(price_date, str) else price_date
     try:
@@ -674,11 +798,18 @@ def get_pricing_feed_status(price_date=date.today()):
         for s in statuses:            
             eta = PRICING_FEEDS[s]['normal_eta'].replace(year=pd.year, month=pd.month, day=pd.day)
             statuses[s]['normal_eta'] = eta.isoformat()
-        return {
-            'status': 'success',
-            'data': statuses,
-            'message': None
-        }, 200
+        if len(statuses):
+            return {
+                'status': 'success',
+                'data': statuses,
+                'message': None
+            }, 200
+        else:
+            return {
+                'status': 'warning',
+                'data': None,
+                'message': 'No data was found.'
+            }, 200
     except exc.SQLAlchemyError as e:
         logging.exception(e)
         return {
@@ -687,6 +818,163 @@ def get_pricing_feed_status(price_date=date.today()):
             'message': f'SQLAlchemy error: {e}'
         }, 500
 
+def get_apx_SourceID(source: str) -> int:
+    """
+    Retrieves the APX Source ID for the given source.
+
+    Args:
+    - source (str): The source to get the APX Source ID for.
+
+    Returns:
+    - int: The APX Source ID for the given source.
+    """
+    if source in APX_PX_SOURCES:
+        return APX_PX_SOURCES[source]
+    return APX_PX_SOURCES['DEFAULT']
+
+def price_file_name(from_date: str, price_type: str = '') -> str:
+    """
+    Generates the name of the price file, as required for IMEX.
+
+    Args:
+    - from_date (str): The date the prices were generated.
+    - price_type (str, optional): The price type. Defaults to an empty string. This is
+        used to build the desired file name for other price types (e.g. yield, duration).
+
+    Returns:
+    - str: The name of the price file.
+    """
+    name = datetime.strptime(from_date, "%Y-%m-%d").strftime("%m%d%y")
+    return f"{name}{price_type}.pri"
+
+def prices_to_tab_delim_files(prices):
+    """
+    Writes the prices to tab-delimited files.
+
+    Args:
+    - prices (Dict): A dictionary containing the prices to write.
+
+    Returns:
+    - Tuple: A tuple with the folder path and a list of file paths.
+    """
+    # TODO_OPTIMIZE: consider making this query APX prices, and only include prices which are changes
+    base_path = os.path.join(config.DATA_DIR, 'lw', 'pricing')
+    today_folder = prepare_dated_file_path(folder_name=base_path, date=date.today(), file_name='', rotate=False)
+    files = []
+    for from_date in prices:
+        for pt in prices[from_date]:
+            full_path = prepare_dated_file_path(folder_name=base_path, date=date.today(), file_name=price_file_name(from_date, price_type=APX_PRICE_TYPES[pt]), rotate=True)
+            pxs = pd.DataFrame(columns=['apx_sec_type','apx_symbol',pt,'message','source'])
+            for px in prices[from_date][pt]:
+                # logging.debug(px)
+                px['source'] = get_apx_SourceID(px['source'])
+                pxs = pd.concat([pxs, pd.DataFrame([px])], ignore_index=True)
+            pxs.to_csv(path_or_buf=full_path, sep='\t', header=False, index=False)
+            files.append(full_path)
+    return today_folder, files
+
+def add_price(res_prices, px):
+    """
+    Adds the given price to the dictionary of prices.
+
+    Args:
+    - res_prices (Dict): The dictionary to add the price to.
+    - px (Dict): The price to add.
+
+    Returns:
+    - Dict: The updated dictionary of prices.
+    """
+    from_date = px.pop('from_date')
+    if from_date not in res_prices:
+        res_prices[from_date] = {}
+    for pt in APX_PRICE_TYPES:
+        if pt in px:
+            if pt in res_prices[from_date]:
+                res_prices[from_date][pt].append(px)
+            else:
+                res_prices[from_date][pt] = [px]
+    return res_prices
+
+@api.route('/api/pricing/notification-subscription')
+class PricingNotificationSubscription(Resource):
+    def post(self):
+        payload = api.payload
+        # TODO_CLEANUP: remove below when not needed
+        # below using marshmallow ... may continue trying this if flask_marshmallow isn't sufficient
+        # try:
+        #     data = PricingNotificationSubscriptionSchema().load(payload)
+        # except ValidationError as err:
+        #     return err.messages, 422
+        if 'email' not in payload or 'feed_name' not in payload:
+            return {
+                'status': 'error',
+                'data': None,
+                'message': f'Required field(s) missing: email, feed_name'
+            }, 422
+        # email = parseaddr(payload['email'])[1]
+        try:
+            email = validate_email(payload['email'])["email"]
+        except EmailNotValidError as e:
+            return {
+                'status': 'error',
+                'data': None,
+                'message': str(e)
+            }, 422
+        old_rows = self.set_valid_to_yesterday(email, payload['feed_name'])
+        payload = add_valid_dates(payload)
+        payload = add_asof(payload)
+        return save_df_to_table(pd.DataFrame([payload]), PricingNotificationSubscriptionTable())
+    
+    def get(self):
+        subs = PricingNotificationSubscriptionTable().read()
+        valid_subs = valid(subs)[['email','feed_name','email_on_pending','email_on_in_progress','email_on_complete','email_on_error','email_on_delayed']]
+        return clean(valid_subs)
+
+    def delete(self):
+        payload = api.payload
+        if 'email' not in payload or 'feed_name' not in payload:
+            return {
+                'status': 'error',
+                'data': None,
+                'message': f'Required field(s) missing: email, feed_name'
+            }, 422
+        # email = parseaddr(payload['email'])[1]
+        try:
+            email = validate_email(payload['email'])["email"]
+        except EmailNotValidError as e:
+            return {
+                'status': 'error',
+                'data': None,
+                'message': str(e)
+            }, 422
+        updated_rows = self.set_valid_to_yesterday(email, payload['feed_name'])
+        if updated_rows:
+            return {
+                'status': 'success',
+                'message': f"deleted {updated_rows} subscription(s) for {email} {payload['feed_name']}"
+            }, 200
+        else:
+            return {
+                'status': 'warning',
+                'data': None,
+                'message': f"Found nothing to delete for {email} {payload['feed_name']}"
+            }, 200
+
+    def set_valid_to_yesterday(self, email, feed_name):
+        pns_table = PricingNotificationSubscriptionTable()
+        new_vals = {'valid_to': date.today() + timedelta(days=-1)}
+        new_vals = add_asof(new_vals)
+        stmt = update(pns_table.table_def).\
+						where(pns_table.table_def.c.email == email).\
+						where(pns_table.table_def.c.feed_name == feed_name).\
+						where(pns_table.table_def.c.valid_to == None).\
+						values(new_vals)
+        updated_rows = pns_table._database.execute_write(stmt).rowcount
+        logging.debug(
+            f"{pns_table.table_name}: Updated valid_to for {updated_rows} rows for {email} {feed_name}."
+        )
+        return updated_rows
+    
 @api.route('/api/pricing/feed-status')
 class PricingFeedStatus(Resource):
     def get(self):
@@ -704,43 +992,75 @@ class PricingFeedStatusByDate(Resource):
         # return mon.to_dict('records')
         # END old code
 
-def get_apx_SourceID(source):
-    if source in APX_PX_SOURCES:
-        return APX_PX_SOURCES[source]
-    return APX_PX_SOURCES['DEFAULT']
+@api.route('/api/transaction/<string:trade_date>')
+class TransactionByDate(Resource):
+    def get(self, trade_date):
+        txns = vTransactionTable().read_for_trade_date(trade_date=trade_date)
+        return clean(txns)
 
-def price_file_name(from_date, price_type=''):
-    name = datetime.strptime(from_date, "%Y-%m-%d").strftime("%m%d%y")
-    return f"{name}{price_type}.pri"
+@api.route('/api/pricing/audit-reason')
+class PricingAuditReason(Resource):
+    def get(self):
+        reasons = PricingAuditReasonTable().read()
+        valid_reasons = valid(reasons)[['reason']]
+        return clean(valid_reasons)
 
-def prices_to_tab_delim_files(prices):
-    # TODO_OPTIMIZE: consider making this query APX prices, and only include prices which are changes
-    base_path = os.path.join(config.DATA_DIR, 'lw', 'pricing')
-    today_folder = prepare_dated_file_path(folder_name=base_path, date=date.today(), file_name='', rotate=False)
-    files = []
-    for from_date in prices:
-        for pt in prices[from_date]:
-            full_path = prepare_dated_file_path(folder_name=base_path, date=date.today(), file_name=price_file_name(from_date, price_type=APX_PRICE_TYPES[pt]), rotate=True)
-            pxs = pd.DataFrame(columns=['apx_sec_type','apx_symbol',pt,'message','source'])
-            for px in prices[from_date][pt]:
-                # logging.info(px)
-                px['source'] = get_apx_SourceID(px['source'])
-                pxs = pd.concat([pxs, pd.DataFrame([px])], ignore_index=True)
-            pxs.to_csv(path_or_buf=full_path, sep='\t', header=False, index=False)
-            files.append(full_path)
-    return today_folder, files
+@api.route('/api/pricing/attachment/<string:price_date>')
+class PricingAttachmentByDate(Resource):
+    def post(self, price_date):
+        payload = api.payload
+        if 'files' not in payload:
+            return {
+                'status': 'error',
+                'data': payload,
+                'message': f"payload must contain files"
+            }, 422
+        else:
+            return save_binary_files(price_date, payload['files'])
+    
+    def get(self, price_date):
+        full_path = get_pricing_attachment_folder(price_date)
+        files = []
+        for f in os.listdir(full_path):
+            files.append(os.path.join(full_path, f))
+        return clean(pd.DataFrame(files, columns=['full_path']))
 
-def add_price(res_prices, px):
-    from_date = px.pop('from_date')
-    if from_date not in res_prices:
-        res_prices[from_date] = {}
-    for pt in APX_PRICE_TYPES:
-        if pt in px:
-            if pt in res_prices[from_date]:
-                res_prices[from_date][pt].append(px)
-            else:
-                res_prices[from_date][pt] = [px]
-    return res_prices
+    def delete(self, price_date):
+        full_path = get_pricing_attachment_folder(price_date)
+        return delete_dir_contents(full_path)
+
+@api.route('/api/pricing/held-security-price')
+class HeldSecurityWithPrices(Resource):
+    def post(self):
+        # Note this is not really a standard "post" as it does not save data - but is created as such 
+        # because we want to accept optional params in the payload rather than the URL, and 
+        # some clients such as AngularJS cannot do so for a GET request.
+        payload = api.payload
+        if 'sec_type' in payload:
+            sec_type = payload['sec_type']
+        else:
+            sec_type = None
+        if 'price_date' in payload:
+            price_date = payload['price_date']
+        else:
+            price_date = date.today()
+        if 'price_type' in payload:
+            price_type = payload['price_type']
+        else:
+            price_type = None
+        curr_bday, prev_bday = get_current_bday(price_date), get_previous_bday(price_date)
+        # logging.info(request.json)
+        # payload = api.payload
+        # if 'price_type' in payload:
+        #     return get_held_security_prices(curr_bday, prev_bday, payload['price_type'])
+        return get_held_security_prices(curr_bday, prev_bday, sec_type, price_type)
+
+@api.route('/api/pricing/price/<string:price_date>')
+class PriceByDate(Resource):
+    def get(self, price_date):
+        prices = vPriceTable().read_for_date(data_date=price_date)
+        prices = trim_px_sources(prices)
+        return clean(prices)
 
 @api.route('/api/pricing/price')
 class PriceByIMEX(Resource):
@@ -803,7 +1123,7 @@ class ManualPricingSecurity(Resource):
                 'data': payload,
                 'message': f"lw_id must be an array"
             }, 422
-        old_rows = self.set_valid_to_yesterday(payload['lw_id'])
+        old_rows = self.set_valid_to_yesterday()
         payload = add_valid_dates(payload)
         payload = add_asof(payload)
         secs = pd.DataFrame.from_dict(payload)
@@ -836,31 +1156,33 @@ class ManualPricingSecurity(Resource):
                 'data': payload,
                 'message': f"lw_id must be an array"
             }, 422
-        updated_rows = self.set_valid_to_yesterday(lw_ids)
+        updated_rows = self.set_valid_to_yesterday(payload['lw_id'])
         if updated_rows:
             return {
                 'status': 'success',
                 'data': None,
-                'message': f"deleted {updated_rows} manually priced securities for {lw_ids.join(',')}"
+                'message': f"deleted {updated_rows} manually priced securities for {','.join(payload['lw_id'])}"
             }, 200
         else:
             return {
                 'status': 'warning',
                 'data': None,
-                'message': f"found nothing to delete for {lw_ids.join(',')}"
+                'message': f"found nothing to delete for {','.join(payload['lw_id'])}"
             }, 200
 
-    def set_valid_to_yesterday(self, lw_ids):
+    def set_valid_to_yesterday(self, lw_ids=None):
         mps_table = PricingManualPricingSecurityTable()
         new_vals = {'valid_to': date.today() + timedelta(days=-1)}
         new_vals = add_asof(new_vals)
         stmt = update(mps_table.table_def)\
-                        .filter(mps_table.table_def.c.valid_to.in_(lw_ids))\
 						.where(mps_table.table_def.c.valid_to == None)\
 						.values(new_vals)
+        if lw_ids is not None:
+            stmt = stmt.filter(mps_table.table_def.c.lw_id.in_(lw_ids))
         updated_rows = mps_table._database.execute_write(stmt).rowcount
-        logging.info(
-            f"{mps_table.table_name}: Updated valid_to for {updated_rows} rows for {lw_ids.join(',')}."
+        rows_updated_for = ('all' if lw_ids is None else ','.join(lw_ids))
+        logging.debug(
+            f"{mps_table.table_name}: Updated valid_to for {updated_rows} rows for {rows_updated_for}."
         )
         return updated_rows
     
@@ -979,7 +1301,7 @@ class PricingColumnConfig(Resource):
 						where(pcc_table.table_def.c.valid_to == None).\
 						values(new_vals)
         updated_rows = pcc_table._database.execute_write(stmt).rowcount
-        logging.info(
+        logging.debug(
             f"{pcc_table.table_name}: Updated valid_to for {updated_rows} rows for {user_id}."
         )
         return updated_rows
@@ -990,8 +1312,8 @@ class PriceCountBySource(Resource):  # TODO_WAVE4: implement
         return "{\"noteyet\": \"implemented\"}", 200
         prices = vPriceTable().read_for_date(data_date=price_date)
         price_source_counts = prices.groupby(['source'])['source'].count()
-        logging.info(type(price_source_counts))
-        logging.info(price_source_counts)
+        logging.debug(type(price_source_counts))
+        logging.debug(price_source_counts)
         # price_source_counts = price_source_counts.drop(['PXAPX','LWCOMPOSITE'])
         return clean(price_source_counts.to_frame().reset_index())
 
@@ -1046,19 +1368,19 @@ class Position(Resource):
 @api.route('/api/zTEST/price-storedproc')
 class PriceByStoredProc(Resource):
     def post(self):
-        logging.info('in post')
+        logging.debug('in post')
         payload = api.payload
         temp_prices = pd.DataFrame(columns=['_SPID','Date','Type','Symbol','PriceValue','SourceID','PriceTypeID','SecurityID','ThruDate'])
         req_missing = []
         px_hist_table = TempPriceHistoryTable()
         with Session(px_hist_table._database.engine) as session:
-            logging.info('in session')
+            logging.debug('in session')
             spid_res = session.execute(text("select @@SPID as spid"))
             for r in spid_res:
-                logging.info(r)
-                logging.info(type(r))
+                logging.debug(r)
+                logging.debug(type(r))
                 spid = r[0]
-            logging.info(f"got SPID {spid}")
+            logging.debug(f"got SPID {spid}")
             for px in payload['prices']:
                 for rf in ['apx_sec_type','apx_symbol','apx_security_id','source','price_type','price_value','from_date','thru_date']:
                     if rf not in px:
@@ -1098,12 +1420,12 @@ class PriceByStoredProc(Resource):
         # TODO_NEXT: figure out if PricePrec will auto-populate
         # TODO_NEXT: map lw.dbo.pricing.source to APX SourceID?
         # TODO_NEXT: insert into APXFirm.Temp.PriceHistory
-            logging.info(f"About to insert temp prices... {temp_prices}")
+            logging.debug(f"About to insert temp prices... {temp_prices}")
             # px_hist_table.bulk_insert(temp_prices)
             row_cnt = temp_prices.to_sql(name=px_hist_table.table_name
                 , con=px_hist_table._database.engine, schema=px_hist_table.schema
                 , if_exists='append', index=False)
-            logging.info(f"Done insert temp prices. {row_cnt} rows.")
+            logging.debug(f"Done insert temp prices. {row_cnt} rows.")
         # TODO_NEXT: call pAxPriceHistoryPutBulk to inject to APX
         # TODO_NEXT: capture any SQL errors
         # TODO_NEXT: delete from APXFirm.Temp.PriceHistory
@@ -1112,7 +1434,7 @@ class PriceByStoredProc(Resource):
 class HeldSecurityWithPrices(Resource):
     def get(self):
         curr_bday, prev_bday = '2023-01-04', '2023-01-03'  # get_current_bday(date.today()), get_previous_bday(date.today())
-        # logging.info(request.json)
+        # logging.debug(request.json)
         # payload = api.payload
         # if 'price_type' in payload:
         #     return get_held_security_prices(curr_bday, prev_bday, payload['price_type'])
@@ -1128,7 +1450,7 @@ class HeldSecurityWithPricesByType(Resource):
 class HeldSecurityWithPricesByDate(Resource):
     def get(self, price_date):
         curr_bday, prev_bday = get_current_bday(datetime.strptime(price_date, '%Y%m%d')), get_previous_bday(datetime.strptime(price_date, '%Y%m%d'))
-        # logging.info(curr_bday, prev_bday)
+        # logging.debug(curr_bday, prev_bday)
         # payload = api.payload
         # if 'price_type' in payload:
         #     return get_held_security_prices(curr_bday, prev_bday, payload['price_type'])
@@ -1155,7 +1477,7 @@ class HeldSecurityWithPricesByType(Resource):
 class HeldSecurityWithPricesByDate(Resource):
     def get(self, price_date):
         curr_bday, prev_bday = get_current_bday(datetime.strptime(price_date, '%Y%m%d')), get_previous_bday(datetime.strptime(price_date, '%Y%m%d'))
-        # logging.info(curr_bday, prev_bday)
+        # logging.debug(curr_bday, prev_bday)
         # payload = api.payload
         # if 'price_type' in payload:
         #     return get_held_security_prices(curr_bday, prev_bday, payload['price_type'])
