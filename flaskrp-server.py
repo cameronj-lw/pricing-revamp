@@ -1,4 +1,5 @@
 
+# TODO_REFACTOR: clean up imports, remove ones not used
 import json
 import logging
 import numpy as np
@@ -18,6 +19,13 @@ import pymsteams
 from sqlalchemy import exc, text, update
 from sqlalchemy.orm import Session
 
+# Import LW libs ( PF version )
+# TODO_PROD: better way to do this - detect environment somehow? 
+if os.environ.get('pythonpath') is None:
+	pythonpath = '\\\\dev-data\\lws$\\cameron\\lws\\libpy\\lib'
+	os.environ['pythonpath'] = pythonpath
+	sys.path.append(pythonpath)
+
 from lw import config
 from lw.core.command import BaseCommand
 from lw.core import EXIT_SUCCESS, EXIT_FAILURE
@@ -35,8 +43,11 @@ from lw.db.coredb.vsecurity import vSecurityTable
 from lw.db.coredb.vtransaction import vTransactionTable
 from lw.db.mgmtdb.monitor import MonitorTable
 from lw.db.lwdb.apx_appraisal import ApxAppraisalTable
+# from lw.util.dataframe import NaN_NaT_to_none
 from lw.util.date import format_time, get_current_bday, get_previous_bday, get_next_bday
 from lw.util.file import prepare_dated_file_path
+
+import flaskrp_helper
 
 
 # globals
@@ -45,855 +56,6 @@ ma = Marshmallow(app)
 api = Api(app)
 CORS(app)
 
-
-PRICING_FEEDS = {
-    'FTSE': {
-        'FTP_DOWNLOAD': [
-            # run_group, [run_names]
-            ('FTP-FTSETMX_PX', ['FQCOUPON','FQFRN','FQMBS','FQMBSF','SCMHPDOM','SMIQUOTE'])
-        ],
-        'LOAD2LW': [
-            ('FTSETMX_PX', ['FQCOUPON','FQFRN','FQMBS','FQMBSF','SCMHPDOM','SMIQUOTE'])
-        ],
-        'LOAD2PRICING': [
-            ('FTSETMX_PX', ['PostProcess'])
-        ],
-        'normal_eta': datetime.today().replace(hour=14, minute=15)
-    },
-    'MARKIT': {
-        'FTP_UPLOAD': [
-            ('MARKIT_PRICE', ['ISINS_SEND'])
-        ],
-        'FTP_DOWNLOAD': [
-            ('FTP-MARKIT', ['LeithWheeler_Nxxxx_Standard'])
-        ],
-        'LOAD2LW': [
-            ('MARKIT_PRICE', ['MARKIT_PRICE'])
-        ],
-        'LOAD2PRICING': [
-            ('MARKIT_PRICE', ['MARKIT_PRICE'])
-        ],
-        'normal_eta': datetime.today().replace(hour=13, minute=30)
-    },
-    'FUNDRUN': {
-        'FTP_UPLOAD': [
-            ('FUNDRUN', ['EQUITY_UPLOAD'])
-        ],
-        'FTP_DOWNLOAD': [
-            ('FTP-FUNDRUN_PRICE_EQ', ['FUNDRUN_PRICE_EQ'])
-        ],
-        'LOAD2LW': [
-            ('FUNDRUN', ['EQUITY_PRICE_MAIN'])
-        ],
-        'LOAD2PRICING': [
-            ('FUNDRUN', ['EQUITY_PRICE_MAIN'])
-        ],
-        'normal_eta': datetime.today().replace(hour=13, minute=45)
-    },
-    'FUNDRUN_LATAM': {
-        'FTP_UPLOAD': [
-            ('FUNDRUN', ['EQUITY_UPLOAD'])
-        ],
-        'FTP_DOWNLOAD': [
-            ('FTP-FUNDRUN_PRICE_EQ_LATAM', ['FUNDRUN_PRICE_EQ_LATAM'])
-        ],
-        'LOAD2LW': [
-            ('FUNDRUN', ['EQUITY_PRICE_LATAM'])
-        ],
-        'LOAD2PRICING': [
-            ('FUNDRUN', ['EQUITY_PRICE_LATAM'])
-        ],
-        'normal_eta': datetime.today().replace(hour=14, minute=00)
-    },
-    'BLOOMBERG': { 
-        'BB_SNAP': [
-            ('BB-SNAP', ['BOND_PRICE'])
-        ],
-        'LOAD2PRICING': [
-            ('LOADPRICE_FI', ['BOND_PRICE'])
-        ],
-        'normal_eta': datetime.today().replace(hour=14, minute=30)
-    },
-}
-
-# TODO_PROD: change all references to APX to PMS where possible
-APX_SEC_TYPES = {
-    # TODO_TO: confirm if desired
-    'bond': ['cb', 'cf', 'cm', 'cv', 'fr', 'lb', 'sf', 'tb'],
-    'equity': ['cc', 'ce', 'cg', 'ch', 'ci', 'cj', 'ck', 'cn', 'cr', 'cs', 'ct', 'cu', 'ps']
-}
-
-APX_PRICE_TYPES = {
-    'price_value': ''  # Standard (price)
-    , 'duration_value': '_LWBondDur'
-    , 'yield_value': '_LWBondYield'
-}
-
-APX_PX_SOURCES = {
-    # 'LWDB source': APX source ID   # APX source name
-    'DEFAULT'               : 3000,  # LW Not Classified
-    'FTSE'                  : 3006,  # LW FTSE TMX
-    'FTSETMX_PX'            : 3006,  # LW FTSE TMX
-    'BLOOMBERG'             : 3004,  # LW Bloomberg
-    'MARKIT'                : 3005,  # LW Markit
-    'MARKIT_LOAN'           : 3011,  # LW Markit - Loan
-    'FUNDRUN'               : 3019,  # LW FundRun Equity
-    'FIDESK_MANUALPRICE'    : 3007,  # LW FI Desk - Manual Price
-    'MANUAL'                : 3007,  # LW FI Desk - Manual Price
-    'FIDESK_MISSINGPRICE'   : 3008,  # LW FI Desk - Missing Price
-    'MISSING'               : 3008,  # LW FI Desk - Missing Price
-}
-
-PRICE_HIERARCHY = RELEVANT_PRICES = [
-    # highest to lowest in the hierarchy, i.e. MANUAL is highest
-    # TODO_IDEA: should add more pricing sources to "hierarchy"? 
-    # Only adding ones relevant to pricing revamp for now...
-    'MANUAL','MISSING','FUNDRUN','FTSE','MARKIT','BLOOMBERG','RBC'
-]
-
-
-# TODO_REFACTOR: move API supporting functions to outside of main API driver file
-
-
-def NaN_NaT_to_none(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Replaces NaN and NaT values in the provided DataFrame with None.
-    """
-    return df.replace({np.nan: None, pd.NaT: None})
-
-def clean(df: pd.DataFrame) -> str:
-    """
-    Cleans and formats a DataFrame and returns the results as a JSON string.
-    
-    Args:
-    - df (DataFrame): The DataFrame to clean and format.
-    
-    Returns:
-    - str: A JSON string containing the cleaned and formatted DataFrame, along with a status and message.
-    """
-    if len(df.index):
-        df = NaN_NaT_to_none(df)
-        data_dict = df.to_dict('records')
-        res_dict = {
-            'status': 'success',
-            'data': data_dict,
-            'message': None
-        }
-    else:
-        res_dict = {
-            'status': 'warning',
-            'data': None,
-            'message': 'No data was found.'
-        }
-    res_str = jsonify(res_dict)
-    return res_str
-
-def trim_px_sources(raw_prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    Trims the sources in a DataFrame of prices based on a set of predetermined rules and returns the result.
-    
-    Args:
-    - raw_prices (DataFrame): The DataFrame of raw prices to process.
-    
-    Returns:
-    - DataFrame: The processed DataFrame with sources trimmed according to the rules.
-    """
-    prices = raw_prices
-    prices['source'] = prices['source'].apply(lambda x: 'BLOOMBERG' if (x[:3] == 'BB_' and '_DERIVED' not in x) else x)
-    prices['source'] = prices['source'].apply(lambda x: 'FTSE' if x == 'FTSETMX_PX' else x)
-    prices['source'] = prices['source'].apply(lambda x: 'FUNDRUN' if x == 'FUNDRUN_EQUITY' else x)
-    prices['source'] = prices['source'].apply(lambda x: 'MANUAL' if x == 'FIDESK_MANUALPRICE' else x)
-    prices['source'] = prices['source'].apply(lambda x: 'MISSING' if x == 'FIDESK_MISSINGPRICE' else x)
-    prices = prices[prices['source'].isin(RELEVANT_PRICES)]
-    return prices
-
-def get_chosen_price(prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    Returns the preferred price for a set of prices based on the predetermined hierarchy.
-    
-    Args:
-    - prices (DataFrame): The DataFrame of prices to process.
-    
-    Returns:
-    - DataFrame: The preferred price as a DataFrame with a single row.
-    """
-    chosen_loc = chosen_px = None
-    for i, px in prices.iterrows():
-        src = px['source']
-        logging.debug(f"{src} for {px['lw_id']}")
-        if src not in PRICE_HIERARCHY:
-            continue
-        elif chosen_loc is None:
-            chosen_loc = PRICE_HIERARCHY.index(src)
-            chosen_px = prices.loc[[i]]
-        elif PRICE_HIERARCHY.index(src) < chosen_loc:
-            chosen_loc = PRICE_HIERARCHY.index(src)
-            chosen_px = prices.loc[[i]]
-    if chosen_px is None:
-        return chosen_px
-    return chosen_px
-
-def is_manual(prices):
-    """
-    Determines if the security with the prices provided in the DataFrame was manually priced.
-    A manual price is any price manually inputted by a user (as opposed to from an external source).
-    
-    Args:
-    - prices: A DataFrame of prices for a single security on a single date.
-    
-    Returns:
-    - A boolean value indicating whether the security with the prices provided in the DataFrame 
-        was manually priced.
-    """
-    return (len(prices[prices['source']=='MANUAL']) > 0)
-
-
-def is_missing(prices):
-    """
-    Determines if the security with the prices provided in the DataFrame is a security missing price.
-    A security missing price is one for which we have not yet recieved an external price.
-    
-    Args:
-    - prices: A DataFrame of prices for a single security on a single date.
-    
-    Returns:
-    - A boolean value indicating whether the security with the prices provided in the DataFrame
-        is a security missing price.
-    """
-    relevant_external_sources = [x for x in RELEVANT_PRICES if x not in ['MANUAL','MISSING']]
-    if len(prices[prices['source'].isin(relevant_external_sources)]):
-        return False
-    else:
-        return True
-
-
-def is_override(prices):
-    """
-    Determines if the security with the prices provided in the DataFrame has an overridden price.
-    An overridden price is a manual price (see above) which occurred despite having an external price.
-    
-    Args:
-    - prices: A DataFrame of prices for a single security on a single date.
-    
-    Returns:
-    - A boolean value indicating whether the security with the prices provided in the DataFrame
-        has an overridden price.
-    """
-    return (~is_missing(prices) and is_manual(prices))
-
-
-def first2chars(s):
-    """
-    Returns the first two characters of the provided string.
-    """
-    if s is None:
-        return s
-    else:
-        return s[:2]
-
-
-def add_valid_dates(payload):
-    """
-    Adds valid_from and valid_to fields to a dictionary or DataFrame.
-    
-    Args:
-    - payload: A dictionary or DataFrame.
-    
-    Returns:
-    - The input dictionary or DataFrame with valid_from and valid_to fields added.
-    """
-    payload['valid_from'] = date.today()
-    payload['valid_to'] = None
-    return payload
-
-
-def add_asof(payload):
-    """
-    Adds asofdate and asofuser fields to a dictionary or DataFrame.
-    
-    Args:
-    - payload: A dictionary or DataFrame.
-    
-    Returns:
-    - The input dictionary or DataFrame with asofdate and asofuser fields added.
-    """
-    if 'asofuser' not in payload:
-        payload['asofuser'] = f"{os.getlogin()}_{socket.gethostname()}"
-    payload['asofdate'] = format_time(datetime.now())
-    return payload
-
-def get_securities_by_sec_type(secs, sec_type=None, sec_type_col='apx_sec_type', sec_type_func=first2chars):
-    """
-    Filters securities DataFrame by security type.
-
-    Args:
-    - secs (DataFrame): DataFrame containing securities.
-    - sec_type (str or list, optional): Security type(s) to filter by. If not provided, do not filter.
-    - sec_type_col (str, optional): Column name in 'secs' DataFrame containing security type information.
-    - sec_type_func (function, optional): Function used to transform security types for filtering.
-
-    Returns:
-    - DataFrame: Filtered 'secs' DataFrame.
-    """
-    if sec_type is None:
-        return secs
-    if isinstance(sec_type, str):  # convert to list
-        if sec_type in APX_SEC_TYPES:
-            sec_type = APX_SEC_TYPES[sec_type]  # should be a list now
-        else:
-            sec_type = [sec_type]
-    if isinstance(sec_type, list):
-        if sec_type_func is None:
-            return secs[secs[sec_type_col].isin(sec_type)]
-        else:
-            processed_sec_types = secs[sec_type_col].apply(sec_type_func)
-            return secs[processed_sec_types.isin(sec_type)]
-
-def get_held_securities(curr_bday, sec_type=None):
-    """
-    Retrieves held securities for a given date, optionally filtering by security type.
-
-    Args:
-    - curr_bday (str): Date to retrieve held securities for (in YYYYMMDD format).
-    - sec_type (str or list, optional): Security type(s) to filter by.
-
-    Returns:
-    - DataFrame: Held securities DataFrame.
-    """
-    curr_bday_appr = ApxAppraisalTable().read_for_date(curr_bday)
-    if len(curr_bday_appr):  # if there are Appraisal results for curr day, use it
-        secs = vSecurityTable().read()
-        secs = get_securities_by_sec_type(secs, sec_type)
-        held_secs = list(curr_bday_appr['ProprietarySymbol'])
-        held = secs[secs['lw_id'].isin(held_secs)]
-    else:  # if not, use live positions
-        held = vHeldSecurityTable().read()
-        held = get_securities_by_sec_type(held, sec_type)
-    return held
-
-def add_prices(held, i, lw_id, curr_prices, prev_prices):
-    """
-    Add price information to a held security row.
-
-    Args:
-    - held (DataFrame): DataFrame containing held securities.
-    - i (int): Index of the row to add prices to.
-    - lw_id (str): lw_id of the security to add prices for.
-    - curr_prices (DataFrame): DataFrame containing current bday prices.
-    - prev_prices (DataFrame): DataFrame containing previous bday prices.
-
-    Returns:
-    - DataFrame: Modified 'held' DataFrame containing prices.
-    - DataFrame: Combined provided prices for current bday and previous bday.
-    """
-    sec_curr_prices = curr_prices.loc[curr_prices['lw_id'] == lw_id]
-    sec_prev_prices = prev_prices.loc[prev_prices['lw_id'] == lw_id]
-    # add prices:
-    prices = pd.concat([sec_curr_prices, sec_prev_prices], ignore_index=True)
-    if len(prices):
-        prices = NaN_NaT_to_none(prices)
-        held.at[i, 'prices'] = prices.to_dict('records')
-        chosen_px = get_chosen_price(prices)
-        if chosen_px is not None:
-            held.at[i, 'chosen_price'] = chosen_px.to_dict('records')
-    return held, prices
-
-def add_audit_trail(held, i, lw_id, curr_audit_trail):
-    """
-    Add audit trail information to a held security row.
-
-    Args:
-    - held (DataFrame): DataFrame containing held securities.
-    - i (int): Index of the row to add audit trail information to.
-    - lw_id (str): lw_id of the security to add audit trail information for.
-    - curr_audit_trail (DataFrame): DataFrame containing audit trail information.
-
-    Returns:
-    - DataFrame: Modified 'held' DataFrame containing audit trail.
-    """
-    sec_curr_audit = curr_audit_trail.loc[curr_audit_trail['lw_id'] == lw_id]
-    if len(sec_curr_audit):
-        sec_curr_audit = NaN_NaT_to_none(sec_curr_audit)
-        held.at[i, 'audit_trail'] = sec_curr_audit.to_dict('records')
-        if not isinstance(held.at[i, 'audit_trail'], list):  
-            # If only one row, it will be a dict, but we want it as a list:
-            held.at[i, 'audit_trail'] = [held.at[i, 'audit_trail']]
-    return held
-
-def should_exclude_sec(lw_id, prices, price_type, manually_priced_secs):
-    """
-    Determine whether a security should be excluded based on pricing information.
-
-    Args:
-    - lw_id (str): lw_id of the security to check.
-    - prices (DataFrame): DataFrame containing prices for the given security on a single date.
-    - price_type (str or None): Type of pricing information to check for (e.g. 'manual', 'missing', 'override').
-    - manually_priced_secs (DataFrame): DataFrame containing securities which should always be manually priced,
-        even when we have an external price.
-
-    Returns:
-    - bool: Whether the security should be excluded.
-    """
-    if price_type is None:
-        return False
-    if price_type == 'manual':  
-        # securities which have been priced by a user
-        if not is_manual(prices):
-            return True
-    elif price_type == 'missing':  
-        # securities which do not have an external price,
-        # OR are on the "sticky bond" list
-        # TODO_TO: confirm whether desired to include the "sticky bond list" here
-        if not is_missing(prices):
-            if lw_id not in manually_priced_secs['lw_id']:
-                return True
-    elif price_type == 'override':  
-        # securities which have an external price, but were also priced by a user
-        if not is_override(prices):
-            return True
-    # If we made it here, the sec should not be excluded
-    return False
-
-
-def get_held_security_prices(curr_bday, prev_bday, sec_type=None, price_type=None):
-    """
-    Retrieve held securities with price and audit trail information for the provided
-    current and previous business days, optionally filtered by security type and/or price type.
-
-    Args:
-    - curr_bday (str): Date to retrieve held securities for (in YYYYMMDD format).
-    - prev_bday (str): Previous date to retrieve price for (in YYYYMMDD format).
-    - sec_type (str or list, optional): Security type(s) to filter by.
-    - price_type (str or None, optional): Type of pricing information to filter by (e.g. 'manual', 'missing', 'override').
-
-    Returns:
-    - JSON string of held securities with price and audit trail information, along with status and message if applicable.
-    """
-    held = get_held_securities(curr_bday, sec_type)
-    held['prices'] = None
-    curr_prices = vPriceTable().read(data_date=curr_bday)
-    curr_prices = trim_px_sources(curr_prices)
-    # want to include only 1 prev day px: the one from APX
-    prev_prices = vPriceTable().read(data_date=prev_bday, source='PXAPX')
-    prev_prices['source'] = 'APX'
-    curr_audit_trail = PricingAuditTrailTable().read(data_date=curr_bday)
-    manually_priced_secs = get_manual_pricing_securities()  # in case we need to add these below
-    for i, row in held.iterrows():
-        lw_id = row['lw_id']
-        held, prices = add_prices(held, i, lw_id, curr_prices, prev_prices)
-        # remove this security according to type, if requested
-        if should_exclude_sec(lw_id, prices, price_type, manually_priced_secs):
-            held = held.drop(i)
-            continue
-        # add audit trail:
-        held = add_audit_trail(held, i, lw_id, curr_audit_trail)
-    # TODO_WAVE2: make good thru date based on sec type / applicable holiday calendar
-    held['good_thru_date'] = get_next_bday(curr_bday)
-    return clean(held)
-
-def get_pricing_attachment_folder(data_date):
-    """
-    Retrieves the path to the folder containing pricing attachments for a given date.
-
-    Args:
-    - data_date (str): Date to retrieve attachment folder for (in YYYYMMDD format).
-
-    Returns:
-    - str: The path to the folder containing pricing attachments for the given date.
-    """
-    base_path = os.path.join(config.DATA_DIR, 'lw', 'pricing_audit')
-    full_path = prepare_dated_file_path(folder_name=base_path, date=datetime.strptime(data_date, '%Y%m%d'), file_name='', rotate=False)
-    return full_path
-
-def save_binary_files(data_date, files):
-    """
-    Saves binary files to the folder corresponding to data_date.
-
-    Args:
-    - data_date (str): Date for folder where the files will be saved.
-    - files (list): A list of dictionaries where each contains the filename and its binary contents.
-
-    Returns:
-    - Standard result (status/data/message) and HTTP return code
-    """
-
-    # Create the folder if it doesn't exist
-    folder_path = get_pricing_attachment_folder(data_date)
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-
-    # Save each file in the list
-    for f in files:
-        file_name = f['name']
-        file_content = f['binary_content']
-
-        # Create the file path
-        file_path = os.path.join(folder_path, file_name)
-
-        # Save the binary content to the file
-        with open(file_path, "wb") as fp:
-            fp.write(file_content.encode('utf-8'))
-    if len(files):
-        return {
-            'status': 'success',
-            'data': None,
-            'message': f'Saved {len(files)} files to {folder_path}'
-        }, 201
-    else:
-        return {
-            'status': 'warning',
-            'data': None,
-            'message': f'No files were provided, so there is nothing to save.'
-        }, 200
-
-def delete_dir_contents(path):
-    """
-    Deletes all files in a given directory.
-
-    Args:
-    - path (str): The path to the directory whose contents should be deleted.
-
-    Returns:
-    - dict: Standard response (status/data/message).
-    - int: HTTP return code which would be appropriate given the result of the operation.
-    """
-    try:
-        files = os.listdir(path)
-        for f in files:
-            os.remove(os.path.join(path, f))
-        return {
-            'status': 'success',
-            'data': None,
-            'message': f'Deleted {len(files)} files from {path}'
-        }, 200
-    except Exception as e:
-        msg = f'Failed to delete files at {path}: {e}'
-        logging.exception(msg)
-        return {
-            'status': 'error',
-            'data': None,
-            'message': msg
-        }, 500
-
-def valid(df, data_date=date.today()):  
-    """
-    Filters a pandas dataframe to include only rows whose 'valid_from' and 'valid_to' date ranges
-    include the specified date, or are null.
-
-    Args:
-    - df (pandas.DataFrame): The dataframe to be filtered.
-    - data_date (datetime.date): The date to be used for the filtering.
-
-    Returns:
-    - pandas.DataFrame: A new dataframe containing only rows whose 'valid_from' and 'valid_to' date ranges
-                        include the specified date, or are null.
-    """
-    # TODO_REFACTOR: does this belong in a library?
-    valid_from = [
-        pd.isnull(df['valid_from']), df['valid_from'] <= np.datetime64(data_date)
-    ]
-    valid_to = [
-        pd.isnull(df['valid_to']), df['valid_to'] >= np.datetime64(data_date)
-    ]
-    return df.loc[valid_from[0] | valid_from[1]].loc[valid_to[0] | valid_to[1]]
-
-def save_df_to_table(df, table):
-    """
-    Saves a pandas dataframe to a database table using the specified table object's bulk_insert method.
-
-    Args:
-    - df (pandas.DataFrame): The dataframe to be saved.
-    - table (subclass of table.BaseTable or table.ScenarioTable): The database table object to save the dataframe to.
-
-    Returns:
-    - dict: Standard response (status/data/message).
-    - int: HTTP return code which would be appropriate given the result of the operation.
-    """
-    try:
-        res = table.bulk_insert(df)
-        if res.rowcount == len(df.index):
-            return {
-                'status': 'success',
-                'data': None,
-                'message': f"Saved {res.rowcount} rows to " \
-                f"{config.CONN_INFO[table.database_key][config.ENV]['hostname']}." \
-                f"{config.CONN_INFO[table.database_key][config.ENV]['database']}." \
-                f"{table.schema}.{table.table_name}"
-            }, 201
-        else:
-            msg = f'Expected {len(df.index)} rows to be saved, but there were {res.rowcount}!'
-            logging.error(msg)
-            return {
-                'status': 'error',
-                'data': None,
-                'message': msg
-            }, 500
-    except exc.SQLAlchemyError as e:
-        logging.exception(e)
-        return {
-            'status': 'error',
-            'data': None,
-            'message': f'SQLAlchemy error: {e}'
-        }, 500
-
-def is_error(pf, data_date):
-    """
-    Determines if a given pricing feed is in an error state for a given date.
-
-    Args:
-    - pf (str): The name of the pricing feed to check.
-    - data_date (datetime.date): The date to check for.
-
-    Returns:
-    - tuple: A tuple containing a boolean indicating whether or not an error state was detected, and a datetime
-            indicating the maximum timestamp of the error (or the current datetime if no error was detected).
-    """
-    res, max_ts = False, datetime.fromordinal(1)  # beginning of time
-    for task in PRICING_FEEDS[pf]:
-        if not isinstance(PRICING_FEEDS[pf][task], list):
-            continue
-        for (rg, rns) in PRICING_FEEDS[pf][task]:
-            for rn in rns:                    
-                mon = MonitorTable().read(scenario=MonitorTable().base_scenario, data_date=data_date, run_group=rg, run_name=rn, run_type='RUN')
-                error = mon[mon['run_status'] == 1]
-                if len(error.index):
-                    res = True
-                    max_ts = max(max_ts, error['asofdate'].max())
-    return res, (max_ts if res else datetime.now())
-
-def is_priced(pf, data_date):
-    """
-    Determines if a given pricing feed has been successfully priced for a given date.
-
-    Args:
-    - pf (str): The name of the pricing feed to check.
-    - data_date (datetime.date): The date to check for.
-
-    Returns:
-    - tuple: A tuple containing a boolean indicating whether or not successful pricing was detected, and a datetime
-            indicating the maximum timestamp of the pricing completion (or the current datetime if no successful pricing
-            was detected).
-    """
-    max_ts = datetime.fromordinal(1)  # beginning of time
-    if 'LOAD2PRICING' in PRICING_FEEDS[pf]:
-        for (rg, rns) in PRICING_FEEDS[pf]['LOAD2PRICING']:
-            for rn in rns:
-                mon = MonitorTable().read(scenario=MonitorTable().base_scenario, data_date=data_date, run_group=rg, run_name=rn, run_type='RUN')
-                complete = mon[mon['run_status'] == 0]
-                if not len(complete.index):
-                    return False, datetime.now()
-                max_ts = max(max_ts, complete['asofdate'].max())
-        return True, max_ts
-    return False, datetime.now()
-
-def is_in_progress(pf, data_date):
-    """
-    Determines if a given pricing feed is currently in progress for a given date.
-
-    Args:
-    - pf (str): The name of the pricing feed to check.
-    - data_date (datetime.date): The date to check for.
-
-    Returns:
-    - tuple: A tuple containing a boolean indicating whether or not pricing is currently in progress, and a datetime
-            indicating the maximum timestamp of the in-progress state (or the current datetime if no in-progress state
-            was detected).
-    """
-    res, max_ts = False, datetime.fromordinal(1)  # beginning of time
-    for task in ['BB_SNAP', 'FTP_DOWNLOAD', 'LOAD2LW', 'LOAD2PRICING']:
-        if task in PRICING_FEEDS[pf]:
-            for (rg, rns) in PRICING_FEEDS[pf][task]:
-                for rn in rns:                    
-                    mon = MonitorTable().read(scenario=MonitorTable().base_scenario, data_date=data_date, run_group=rg, run_name=rn, run_type='RUN')
-                    in_progress = mon[mon['run_status'] == (-1 | 0)]  # include "success" here in case some are success and others not started
-                    if len(in_progress.index):
-                        res = True
-                        max_ts = max(max_ts, in_progress['asofdate'].max())
-    return res, (max_ts if res else datetime.now())
-
-def is_delayed(pf, data_date):
-    """
-    Determines if a given pricing feed is delayed for a given date.
-
-    Args:
-    - pf (str): The name of the pricing feed to check.
-    - data_date (datetime.date): The date to check for.
-
-    Returns:
-    - tuple: A tuple containing a boolean indicating whether or not a delay was detected, and a datetime
-            indicating the current datetime (since this function only checks if a delay is present, it is always
-            called at the time of the delay, so the current datetime is used to indicate the time of the delay).
-    """ 
-    if is_priced(pf, data_date)[0]:
-        return False, datetime.now()
-    if 'normal_eta' in PRICING_FEEDS[pf]:
-        if PRICING_FEEDS[pf]['normal_eta'] < datetime.now():
-            return True, datetime.now()
-    return False, datetime.now()
-
-def is_pending(pf, data_date):
-    """
-    Determines if a given pricing feed is pending for a given date.
-
-    Args:
-    - pf (str): The name of the pricing feed to check.
-    - data_date (datetime.date): The data date to check for.
-
-    Returns:
-    - tuple: A tuple with a boolean value indicating whether the pricing feed is pending, and a datetime 
-            representing the timestamp of when the FTP Upload completed.
-    """
-    max_ts = datetime.fromordinal(1)  # beginning of time
-    if 'FTP_UPLOAD' in PRICING_FEEDS[pf]:
-        for (rg, rns) in PRICING_FEEDS[pf]['FTP_UPLOAD']:
-            for rn in rns:
-                mon = MonitorTable().read(scenario=MonitorTable().base_scenario, data_date=data_date, run_group=rg, run_name=rn, run_type='RUN')
-                complete = mon[mon['run_status'] == 0]
-                if not len(complete.index):
-                    return False, datetime.now()
-                max_ts = max(max_ts, complete['asofdate'].max())
-        return True, max_ts
-    return False, datetime.now()
-
-# class PricingFeed(Object):
-#     def __init__(self, data_date=date.today()):
-#         self.data_date = data_date
-#         self.status = None
-
-def get_pricing_feed_status(price_date=date.today()):
-    """
-    Retrieves the pricing feed status for the given price date.
-
-    Args:
-    - price_date (optional): The price date to check for. Defaults to today's date.
-
-    Returns:
-    - Tuple: A tuple with a standard response dictionary (status/data/message) containing 
-            pricing feed statuses, and an appropriate HTTP status code given the result of the operation.
-    """
-    statuses = {}
-    pd = datetime.strptime(price_date, '%Y%m%d') if isinstance(price_date, str) else price_date
-    try:
-        for pf in PRICING_FEEDS:
-            error = is_error(pf, pd)
-            if error[0]:
-                statuses[pf] = {'status': 'ERROR', 'asofdate': error[1].isoformat()}
-                continue
-            priced = is_priced(pf, pd)
-            if priced[0]:
-                statuses[pf] = {'status': 'PRICED', 'asofdate': priced[1].isoformat()}
-                continue
-            in_progress = is_in_progress(pf, pd)
-            if in_progress[0]:
-                statuses[pf] = {'status': 'IN PROGRESS', 'asofdate': in_progress[1].isoformat()}
-                continue
-            delayed = is_delayed(pf, pd)
-            if delayed[0]:
-                statuses[pf] = {'status': 'DELAYED', 'asofdate': delayed[1].isoformat()}
-                continue
-            pending = is_pending(pf, pd)
-            if pending[0]:
-                statuses[pf] = {'status': 'PENDING', 'asofdate': pending[1].isoformat()}
-                continue
-        for s in statuses:            
-            eta = PRICING_FEEDS[s]['normal_eta'].replace(year=pd.year, month=pd.month, day=pd.day)
-            statuses[s]['normal_eta'] = eta.isoformat()
-        if len(statuses):
-            return {
-                'status': 'success',
-                'data': statuses,
-                'message': None
-            }, 200
-        else:
-            return {
-                'status': 'warning',
-                'data': None,
-                'message': 'No data was found.'
-            }, 200
-    except exc.SQLAlchemyError as e:
-        logging.exception(e)
-        return {
-            'status': 'error',
-            'data': None,
-            'message': f'SQLAlchemy error: {e}'
-        }, 500
-
-def get_apx_SourceID(source: str) -> int:
-    """
-    Retrieves the APX Source ID for the given source.
-
-    Args:
-    - source (str): The source to get the APX Source ID for.
-
-    Returns:
-    - int: The APX Source ID for the given source.
-    """
-    if source in APX_PX_SOURCES:
-        return APX_PX_SOURCES[source]
-    return APX_PX_SOURCES['DEFAULT']
-
-def price_file_name(from_date: str, price_type: str = '') -> str:
-    """
-    Generates the name of the price file, as required for IMEX.
-
-    Args:
-    - from_date (str): The date the prices were generated.
-    - price_type (str, optional): The price type. Defaults to an empty string. This is
-        used to build the desired file name for other price types (e.g. yield, duration).
-
-    Returns:
-    - str: The name of the price file.
-    """
-    name = datetime.strptime(from_date, "%Y-%m-%d").strftime("%m%d%y")
-    return f"{name}{price_type}.pri"
-
-def prices_to_tab_delim_files(prices):
-    """
-    Writes the prices to tab-delimited files.
-
-    Args:
-    - prices (Dict): A dictionary containing the prices to write.
-
-    Returns:
-    - Tuple: A tuple with the folder path and a list of file paths.
-    """
-    # TODO_OPTIMIZE: consider making this query APX prices, and only include prices which are changes
-    base_path = os.path.join(config.DATA_DIR, 'lw', 'pricing')
-    today_folder = prepare_dated_file_path(folder_name=base_path, date=date.today(), file_name='', rotate=False)
-    files = []
-    for from_date in prices:
-        for pt in prices[from_date]:
-            full_path = prepare_dated_file_path(folder_name=base_path, date=date.today(), file_name=price_file_name(from_date, price_type=APX_PRICE_TYPES[pt]), rotate=True)
-            pxs = pd.DataFrame(columns=['apx_sec_type','apx_symbol',pt,'message','source'])
-            for px in prices[from_date][pt]:
-                # logging.debug(px)
-                px['source'] = get_apx_SourceID(px['source'])
-                pxs = pd.concat([pxs, pd.DataFrame([px])], ignore_index=True)
-            pxs.to_csv(path_or_buf=full_path, sep='\t', header=False, index=False)
-            files.append(full_path)
-    return today_folder, files
-
-def add_price(res_prices, px):
-    """
-    Adds the given price to the dictionary of prices.
-
-    Args:
-    - res_prices (Dict): The dictionary to add the price to.
-    - px (Dict): The price to add.
-
-    Returns:
-    - Dict: The updated dictionary of prices.
-    """
-    from_date = px.pop('from_date')
-    if from_date not in res_prices:
-        res_prices[from_date] = {}
-    for pt in APX_PRICE_TYPES:
-        if pt in px:
-            if pt in res_prices[from_date]:
-                res_prices[from_date][pt].append(px)
-            else:
-                res_prices[from_date][pt] = [px]
-    return res_prices
 
 @api.route('/api/pricing/notification-subscription')
 class PricingNotificationSubscription(Resource):
@@ -921,14 +83,14 @@ class PricingNotificationSubscription(Resource):
                 'message': str(e)
             }, 422
         old_rows = self.set_valid_to_yesterday(email, payload['feed_name'])
-        payload = add_valid_dates(payload)
-        payload = add_asof(payload)
-        return save_df_to_table(pd.DataFrame([payload]), PricingNotificationSubscriptionTable())
+        payload = flaskrp_helper.add_valid_dates(payload)
+        payload = flaskrp_helper.add_asof(payload)
+        return flaskrp_helper.save_df_to_table(pd.DataFrame([payload]), PricingNotificationSubscriptionTable())
     
     def get(self):
         subs = PricingNotificationSubscriptionTable().read()
-        valid_subs = valid(subs)[['email','feed_name','email_on_pending','email_on_in_progress','email_on_complete','email_on_error','email_on_delayed']]
-        return clean(valid_subs)
+        valid_subs = flaskrp_helper.valid(subs)[['email','feed_name','email_on_pending','email_on_in_progress','email_on_complete','email_on_error','email_on_delayed']]
+        return flaskrp_helper.clean(valid_subs)
 
     def delete(self):
         payload = api.payload
@@ -963,7 +125,7 @@ class PricingNotificationSubscription(Resource):
     def set_valid_to_yesterday(self, email, feed_name):
         pns_table = PricingNotificationSubscriptionTable()
         new_vals = {'valid_to': date.today() + timedelta(days=-1)}
-        new_vals = add_asof(new_vals)
+        new_vals = flaskrp_helper.add_asof(new_vals)
         stmt = update(pns_table.table_def).\
 						where(pns_table.table_def.c.email == email).\
 						where(pns_table.table_def.c.feed_name == feed_name).\
@@ -978,12 +140,12 @@ class PricingNotificationSubscription(Resource):
 @api.route('/api/pricing/feed-status')
 class PricingFeedStatus(Resource):
     def get(self):
-        return get_pricing_feed_status()
+        return flaskrp_helper.get_pricing_feed_status()
             
 @api.route('/api/pricing/feed-status/<string:price_date>')
 class PricingFeedStatusByDate(Resource):
     def get(self, price_date):
-        return get_pricing_feed_status(price_date)           
+        return flaskrp_helper.get_pricing_feed_status(price_date)           
         # BEGIN old code ... TODO_CLEANUP: remove when not needed
         # for col in mon:
         #     if pd.api.types.is_datetime64_any_dtype(mon[col]):
@@ -996,14 +158,14 @@ class PricingFeedStatusByDate(Resource):
 class TransactionByDate(Resource):
     def get(self, trade_date):
         txns = vTransactionTable().read_for_trade_date(trade_date=trade_date)
-        return clean(txns)
+        return flaskrp_helper.clean(txns)
 
 @api.route('/api/pricing/audit-reason')
 class PricingAuditReason(Resource):
     def get(self):
         reasons = PricingAuditReasonTable().read()
-        valid_reasons = valid(reasons)[['reason']]
-        return clean(valid_reasons)
+        valid_reasons = flaskrp_helper.valid(reasons)[['reason']]
+        return flaskrp_helper.clean(valid_reasons)
 
 @api.route('/api/pricing/attachment/<string:price_date>')
 class PricingAttachmentByDate(Resource):
@@ -1016,18 +178,18 @@ class PricingAttachmentByDate(Resource):
                 'message': f"payload must contain files"
             }, 422
         else:
-            return save_binary_files(price_date, payload['files'])
+            return flaskrp_helper.save_binary_files(price_date, payload['files'])
     
     def get(self, price_date):
-        full_path = get_pricing_attachment_folder(price_date)
+        full_path = flaskrp_helper.get_pricing_attachment_folder(price_date)
         files = []
         for f in os.listdir(full_path):
             files.append(os.path.join(full_path, f))
-        return clean(pd.DataFrame(files, columns=['full_path']))
+        return flaskrp_helper.clean(pd.DataFrame(files, columns=['full_path']))
 
     def delete(self, price_date):
-        full_path = get_pricing_attachment_folder(price_date)
-        return delete_dir_contents(full_path)
+        full_path = flaskrp_helper.get_pricing_attachment_folder(price_date)
+        return flaskrp_helper.delete_dir_contents(full_path)
 
 @api.route('/api/pricing/held-security-price')
 class HeldSecurityWithPrices(Resource):
@@ -1053,19 +215,21 @@ class HeldSecurityWithPrices(Resource):
         # payload = api.payload
         # if 'price_type' in payload:
         #     return get_held_security_prices(curr_bday, prev_bday, payload['price_type'])
-        return get_held_security_prices(curr_bday, prev_bday, sec_type, price_type)
+        return flaskrp_helper.get_held_security_prices(curr_bday, prev_bday, sec_type, price_type)
 
 @api.route('/api/pricing/price/<string:price_date>')
 class PriceByDate(Resource):
     def get(self, price_date):
         prices = vPriceTable().read_for_date(data_date=price_date)
-        prices = trim_px_sources(prices)
-        return clean(prices)
+        prices = flaskrp_helper.trim_px_sources(prices)
+        return flaskrp_helper.clean(prices)
 
 @api.route('/api/pricing/price')
 class PriceByIMEX(Resource):
     def post(self):
         payload = api.payload
+        # TODO: Replace "xxx_value" with "xxx"?
+        # payload = {k[:-6]:payload[k] if k.endswith('_value') else k:payload[k] for k in payload}
         req_missing = []
         res_prices = {}
         if 'prices' not in payload:
@@ -1075,7 +239,7 @@ class PriceByIMEX(Resource):
                 'message': f"payload must contain prices"
             }, 422
         for px in payload['prices']:
-            for rf in ['apx_sec_type','apx_symbol','source','price_value','from_date']:
+            for rf in ['apx_sec_type','apx_symbol','source','from_date']:
                 if rf not in px:
                     req_missing.append(rf)  # pd.concat([req_missing, rf])
             if len(req_missing):
@@ -1087,25 +251,57 @@ class PriceByIMEX(Resource):
                     },
                     'message': f"required field(s) missing"
                 }, 422
+            # In addition to above required fields, at least one of below must be provided:
+            valid_price_types = flaskrp_helper.apx_price_types_list()
+            for rf in valid_price_types + ['not_found']:
+                pt_str = ', '.join(valid_price_types)
+                if rf == 'not_found':
+                    return {
+                        'status': 'error',
+                        'data': {
+                            'price': px,
+                            'missing fields': f"{pt_str}"
+                        },
+                        'message': f"At least one of ({pt_str}) must be provided."
+                    }, 422
+                if rf in px:
+                    break
             # passed all QA for this row! Add it to the dict
-            res_prices = add_price(res_prices, px)
-        folder, files = prices_to_tab_delim_files(res_prices)
+            res_prices = flaskrp_helper.add_price(res_prices, px)
+        try:
+            folder, files, changed_prices = flaskrp_helper.prices_to_tab_delim_files(res_prices)
+        except flaskrp_helper.SecurityNotFoundException as e:
+            return {
+                'status': 'error',
+                'data': px,
+                'message': f"Could not find security with {e.missing_col_name} {e.missing_col_value}!"
+            }, 500
+        if not len(changed_prices):
+            return {
+                'status': 'warning',
+                'data': res_prices,
+                'message': f"All prices are the same as current APX, therefore no prices were loaded."
+            }, 200
         for f in files:
             # TODO_PROD: dynamically generate IMEX cmd based on env?
             imex_cmd = f"\\\\devapx-app01.leithwheeler.com\\APX$\\exe\\ApxIX.exe IMEX -i \"-s{folder}\" -Ama \"-f{f}\" -ttab4 -u"
             logging.info('Triggering cmd: %s', imex_cmd)
             os.system(imex_cmd) # TODO_PROD: logging? error handling? 
             logging.info('IMEX complete.')
+        logging.info(f"Changed prices df: {changed_prices}")
+        # changed_prices = changed_prices.to_dict('records')
+        logging.info(f"Changed prices dict: {changed_prices}")
+        # Dict comprehension within list comprehension... not the most readable, but all that's happening here is
+        # removing the 'message' from each dict element. It is expected to be NaN and meaningless / could cause errors.
+        changed_prices = [
+            {k:p[k] for k in p if k != 'message'}
+            for p in changed_prices
+        ]
         return {
             'status': 'success',
-            'data': res_prices,
+            'data': changed_prices,
             'message': f"prices were successfully saved to APX."
         }, 200
-
-def get_manual_pricing_securities(data_date=date.today()):
-    secs = PricingManualPricingSecurityTable().read()
-    valid_secs = valid(secs, data_date)
-    return valid_secs
 
 @api.route('/api/pricing/manual-pricing-security')
 class ManualPricingSecurity(Resource):
@@ -1124,10 +320,10 @@ class ManualPricingSecurity(Resource):
                 'message': f"lw_id must be an array"
             }, 422
         old_rows = self.set_valid_to_yesterday()
-        payload = add_valid_dates(payload)
-        payload = add_asof(payload)
+        payload = flaskrp_helper.add_valid_dates(payload)
+        payload = flaskrp_helper.add_asof(payload)
         secs = pd.DataFrame.from_dict(payload)
-        return save_df_to_table(secs, PricingManualPricingSecurityTable())
+        return flaskrp_helper.save_df_to_table(secs, PricingManualPricingSecurityTable())
     
     # def post_old(self):
     #     payload = api.payload
@@ -1139,8 +335,8 @@ class ManualPricingSecurity(Resource):
     #     PricingManualPricingSecurityTable().bulk_insert(pd.DataFrame([payload]))
     
     def get(self):
-        valid_secs = get_manual_pricing_securities()
-        return clean(valid_secs)
+        valid_secs = flaskrp_helper.get_manual_pricing_securities()
+        return flaskrp_helper.clean(valid_secs)
 
     def delete(self):
         payload = api.payload
@@ -1173,7 +369,7 @@ class ManualPricingSecurity(Resource):
     def set_valid_to_yesterday(self, lw_ids=None):
         mps_table = PricingManualPricingSecurityTable()
         new_vals = {'valid_to': date.today() + timedelta(days=-1)}
-        new_vals = add_asof(new_vals)
+        new_vals = flaskrp_helper.add_asof(new_vals)
         stmt = update(mps_table.table_def)\
 						.where(mps_table.table_def.c.valid_to == None)\
 						.values(new_vals)
@@ -1218,17 +414,17 @@ class PricingAuditTrail(Resource):
                     'message': f"required field(s) missing"
                 }, 422
             # passed all QA for this row! Add it to the df
-            at = add_asof(at)
+            at = flaskrp_helper.add_asof(at)
             at['data_dt'] = price_date
             if res_audit_trail is None:
                 res_audit_trail = pd.DataFrame([at])
             else:
                 res_audit_trail = pd.concat([res_audit_trail, pd.DataFrame([at])], ignore_index=True)
-        return save_df_to_table(res_audit_trail, PricingAuditTrailTable())
+        return flaskrp_helper.save_df_to_table(res_audit_trail, PricingAuditTrailTable())
 
     def get(self, price_date):
         audit_trail = PricingAuditTrailTable().read(data_date=price_date)
-        return clean(audit_trail)
+        return flaskrp_helper.clean(audit_trail)
 
 @api.route('/api/pricing/column-config/<string:user_id>')
 class PricingColumnConfig(Resource):
@@ -1268,14 +464,14 @@ class PricingColumnConfig(Resource):
             else:
                 res_col_config = pd.concat([res_col_config, pd.DataFrame([c])], ignore_index=True)
         old_rows = self.set_valid_to_yesterday(user_id)
-        res_col_config = add_valid_dates(res_col_config)
-        res_col_config = add_asof(res_col_config)
-        return save_df_to_table(res_col_config, PricingColumnConfigTable())
+        res_col_config = flaskrp_helper.add_valid_dates(res_col_config)
+        res_col_config = flaskrp_helper.add_asof(res_col_config)
+        return flaskrp_helper.save_df_to_table(res_col_config, PricingColumnConfigTable())
 
     def get(self, user_id):
         column_config = PricingColumnConfigTable().read(user_id=user_id)
-        valid_config = valid(column_config)
-        return clean(valid_config)
+        valid_config = flaskrp_helper.valid(column_config)
+        return flaskrp_helper.clean(valid_config)
 
     def delete(self, user_id):
         updated_rows = self.set_valid_to_yesterday(user_id)
@@ -1295,7 +491,7 @@ class PricingColumnConfig(Resource):
     def set_valid_to_yesterday(self, user_id):
         pcc_table = PricingColumnConfigTable()
         new_vals = {'valid_to': date.today() + timedelta(days=-1)}
-        new_vals = add_asof(new_vals)
+        new_vals = flaskrp_helper.add_asof(new_vals)
         stmt = update(pcc_table.table_def).\
 						where(pcc_table.table_def.c.user_id == user_id).\
 						where(pcc_table.table_def.c.valid_to == None).\
@@ -1511,8 +707,10 @@ class Command(BaseCommand):
         """
         Run local flask server:
         """
-
-        logging.info('Starting local flask server...')
+        # flaskrp_helper.create_app()
+        # app = Flask(__name__)
+        # app.app_context()
+        logging.info(f'Starting local flask server on port 5000...')
         app.run(host='0.0.0.0', port=5000, debug=True)
         return EXIT_SUCCESS
     
