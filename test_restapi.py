@@ -1,3 +1,14 @@
+"""
+End-to-end integration tests to test the full functionality the API endpoints.
+To run these end-to-end tests: 
+    -run cmd: cd C:\lw\kafka14\scripts
+        (dir where this file is located)
+    -run cmd: pytest test_restapi.py -v --ff -x
+        (see pytest docs or run with -h for info on args)
+    -also useful is to run "not slow" tests by adding '-m "not slow"'
+    -see results
+"""
+
 import base64
 import pytest
 import requests
@@ -161,7 +172,7 @@ def test_notification_subscription():
 @pytest.mark.end2end
 @pytest.mark.slow
 def test_get_transactions_by_date():
-    response = requests.get(f'{BASE_URL}/transaction/20230210')
+    response = requests.get(f'{BASE_URL}/transaction/20230331')
     success_with_data(response)
 
 

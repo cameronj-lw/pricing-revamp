@@ -1,3 +1,12 @@
+"""
+Unit tests to test individual functions which support the API.
+To run these unit tests: 
+    -run cmd: cd C:\lw\kafka14\scripts
+        (dir where this file is located)
+    -run cmd: pytest test_unittests.py -v  --cov=flaskrp_helper --ff -x
+        (see pytest docs or run with -h for info on args)
+    -see results
+"""
 
 import base64
 from datetime import date, datetime
@@ -149,13 +158,13 @@ def test_get_manual_pricing_securities_default_today(mock_mps, fixed_date):
     # Arrange
     mock_mps.return_value.read = mock.Mock(return_value=pd.DataFrame({
         'lw_id': ['LW123', 'LW789', 'LW456']
-        ,'valid_from': [date(1970,1,1), date(2123,1,1), None]
-        ,'valid_to': [None, None, date(2100,1,1)]
+        ,'valid_from_date': [date(1970,1,1), date(2123,1,1), None]
+        ,'valid_to_date': [None, None, date(2100,1,1)]
     }))
     expected = pd.DataFrame({
         'lw_id': ['LW123', 'LW456']
-        ,'valid_from': [date(1970,1,1), None]
-        ,'valid_to': [None, date(2100,1,1)]
+        ,'valid_from_date': [date(1970,1,1), None]
+        ,'valid_to_date': [None, date(2100,1,1)]
     })
 
     # Act
@@ -253,10 +262,10 @@ def test_add_valid_dates():
     output = flaskrp_helper.add_valid_dates(payload)
 
     # Assert
-    assert 'valid_from' in output
-    assert 'valid_to' in output
-    assert output['valid_from'] == date.today()
-    assert output['valid_to'] == None
+    assert 'valid_from_date' in output
+    assert 'valid_to_date' in output
+    assert output['valid_from_date'] == date.today()
+    assert output['valid_to_date'] == None
 
 def test_add_asof_with_existing_asofuser():
     # Arrange
@@ -266,9 +275,21 @@ def test_add_asof_with_existing_asofuser():
     output = flaskrp_helper.add_asof(payload)
 
     # Assert
-    assert 'asofdate' in output
-    assert output['asofuser'] == 'test_user'
-    assert isinstance(output['asofdate'], str)
+    assert 'modified_at' in output
+    assert isinstance(output['modified_at'], str)
+    assert output['modified_by'] == 'test_user'
+
+def test_add_asof_with_existing_modified_by():
+    # Arrange
+    payload = {'key': 'value', 'modified_by': 'test_user'}
+
+    # Act
+    output = flaskrp_helper.add_asof(payload)
+
+    # Assert
+    assert 'modified_at' in output
+    assert isinstance(output['modified_at'], str)
+    assert output['modified_by'] == 'test_user'
 
 def test_add_asof_without_existing_asofuser():
     # Arrange
@@ -278,21 +299,21 @@ def test_add_asof_without_existing_asofuser():
     output = flaskrp_helper.add_asof(payload)
 
     # Assert
-    assert 'asofdate' in output
-    assert 'asofuser' in output
-    assert output['asofuser'] == f"{os.getlogin()}_{socket.gethostname()}"
-    assert isinstance(output['asofdate'], str)
+    assert 'modified_at' in output
+    assert isinstance(output['modified_at'], str)
+    assert 'modified_by' in output
+    assert output['modified_by'] == f"{os.getlogin()}_{socket.gethostname()}"
 
 @pytest.fixture
 def example_secs_with_sec_types():
     return pd.DataFrame({
-        'apx_sec_type': ['cb', 'cm', 'cs', 'cu'],
+        'pms_sec_type': ['cb', 'cm', 'cs', 'cu'],
         'security_id': [1, 2, 3, 4],
     })
 
 def test_get_securities_by_sec_type(example_secs_with_sec_types):
     # Arrange
-    expected = pd.DataFrame({'apx_sec_type': ['cu'], 'security_id': [4]})
+    expected = pd.DataFrame({'pms_sec_type': ['cu'], 'security_id': [4]})
 
     # Act
     result = flaskrp_helper.get_securities_by_sec_type(example_secs_with_sec_types, sec_type='cu')
@@ -302,7 +323,7 @@ def test_get_securities_by_sec_type(example_secs_with_sec_types):
 
 def test_get_securities_by_sec_type_no_func(example_secs_with_sec_types):
     # Arrange
-    expected = pd.DataFrame({'apx_sec_type': ['cu'], 'security_id': [4]})
+    expected = pd.DataFrame({'pms_sec_type': ['cu'], 'security_id': [4]})
 
     # Act
     result = flaskrp_helper.get_securities_by_sec_type(example_secs_with_sec_types, sec_type='cu', sec_type_func=None)
@@ -312,7 +333,7 @@ def test_get_securities_by_sec_type_no_func(example_secs_with_sec_types):
 
 def test_get_securities_by_sec_type_bond(example_secs_with_sec_types):
     # Arrange
-    expected = pd.DataFrame({'apx_sec_type': ['cb', 'cm'], 'security_id': [1, 2]})
+    expected = pd.DataFrame({'pms_sec_type': ['cb', 'cm'], 'security_id': [1, 2]})
 
     # Act
     result = flaskrp_helper.get_securities_by_sec_type(example_secs_with_sec_types, sec_type='bond')
@@ -322,7 +343,7 @@ def test_get_securities_by_sec_type_bond(example_secs_with_sec_types):
 
 def test_get_securities_by_sec_type_equity(example_secs_with_sec_types):
     # Arrange
-    expected = pd.DataFrame({'apx_sec_type': ['cs', 'cu'], 'security_id': [3, 4]})
+    expected = pd.DataFrame({'pms_sec_type': ['cs', 'cu'], 'security_id': [3, 4]})
 
     # Act
     result = flaskrp_helper.get_securities_by_sec_type(example_secs_with_sec_types, sec_type='equity')
@@ -343,11 +364,11 @@ def mock_securities():
         ,'apx_sec_type': ['cbca', 'csus', 'cmca']
     })
 
-# @mock.patch('flaskrp_helper.vSecurityTable.read', return_value=pd.DataFrame({
+# @mock.patch('flaskrp_helper.vwSecurityTable.read', return_value=pd.DataFrame({
 #     'lw_id': ['LW123', 'LW456', 'LW789']
 #     ,'apx_sec_type': ['cbca', 'csus', 'cmca']
 # }))
-# @mock.patch('flaskrp_helper.vHeldSecurityTable.read', return_value=pd.DataFrame({
+# @mock.patch('flaskrp_helper.vwHeldSecurityTable.read', return_value=pd.DataFrame({
 #     'lw_id': ['LW123', 'LW456', 'LW789']
 #     ,'apx_sec_type': ['cbca', 'csus', 'cmca']
 # }))
@@ -355,25 +376,25 @@ def mock_securities():
 #     'ProprietarySymbol': ['LW123', 'LW456', 'LW789']
 # }))
 
-@mock.patch('flaskrp_helper.vSecurityTable')
-@mock.patch('flaskrp_helper.vHeldSecurityTable')
+@mock.patch('flaskrp_helper.vwSecurityTable')
+@mock.patch('flaskrp_helper.vwHeldSecurityTable')
 @mock.patch('flaskrp_helper.ApxAppraisalTable')
 def test_get_held_securities(mock_appr, mock_held_sec, mock_sec):
     # Arrange  # TODO_REFACTOR: more code-efficient way to do this?
     mock_sec.return_value.read = mock.Mock(return_value=pd.DataFrame({
         'lw_id': ['LW123', 'LW456', 'LW789']
-        ,'apx_sec_type': ['cbca', 'csus', 'cmca']
+        ,'pms_sec_type': ['cbca', 'csus', 'cmca']
     }))
     mock_held_sec.return_value.read = mock.Mock(return_value=pd.DataFrame({
         'lw_id': ['LW123', 'LW789']
-        ,'apx_sec_type': ['cbca', 'cmca']
+        ,'pms_sec_type': ['cbca', 'cmca']
     }))
     mock_appr.return_value.read_for_date = mock.Mock(return_value=pd.DataFrame({
         'ProprietarySymbol': ['LW123', 'LW789']
     }))
     expected = pd.DataFrame({
         'lw_id': ['LW123', 'LW789']
-        ,'apx_sec_type': ['cbca', 'cmca']
+        ,'pms_sec_type': ['cbca', 'cmca']
     })
 
     # Act
@@ -382,25 +403,25 @@ def test_get_held_securities(mock_appr, mock_held_sec, mock_sec):
     # Assert
     assert result.equals(expected)
 
-@mock.patch('flaskrp_helper.vSecurityTable')
-@mock.patch('flaskrp_helper.vHeldSecurityTable')
+@mock.patch('flaskrp_helper.vwSecurityTable')
+@mock.patch('flaskrp_helper.vwHeldSecurityTable')
 @mock.patch('flaskrp_helper.ApxAppraisalTable')
 def test_get_held_securities_equity(mock_appr, mock_held_sec, mock_sec):
     # Arrange  # TODO_REFACTOR: more code-efficient way to do this?
     mock_sec.return_value.read = mock.Mock(return_value=pd.DataFrame({
         'lw_id': ['LW123', 'LW456', 'LW789']
-        ,'apx_sec_type': ['cbca', 'csus', 'cmca']
+        ,'pms_sec_type': ['cbca', 'csus', 'cmca']
     }))
     mock_held_sec.return_value.read = mock.Mock(return_value=pd.DataFrame({
         'lw_id': ['LW456', 'LW789']
-        ,'apx_sec_type': ['csus', 'cmca']
+        ,'pms_sec_type': ['csus', 'cmca']
     }))
     mock_appr.return_value.read_for_date = mock.Mock(return_value=pd.DataFrame({
         'ProprietarySymbol': ['LW456', 'LW789']
     }))
     expected = pd.DataFrame({
         'lw_id': ['LW456']
-        ,'apx_sec_type': ['csus']
+        ,'pms_sec_type': ['csus']
     })
 
     # Act
@@ -409,25 +430,25 @@ def test_get_held_securities_equity(mock_appr, mock_held_sec, mock_sec):
     # Assert
     assert result.equals(expected)
 
-@mock.patch('flaskrp_helper.vSecurityTable')
-@mock.patch('flaskrp_helper.vHeldSecurityTable')
+@mock.patch('flaskrp_helper.vwSecurityTable')
+@mock.patch('flaskrp_helper.vwHeldSecurityTable')
 @mock.patch('flaskrp_helper.ApxAppraisalTable')
 def test_get_held_securities_equity_live_positions(mock_appr, mock_held_sec, mock_sec):
     # Arrange  # TODO_REFACTOR: more code-efficient way to do this?
     mock_sec.return_value.read = mock.Mock(return_value=pd.DataFrame({
         'lw_id': ['LW123', 'LW456', 'LW789']
-        ,'apx_sec_type': ['cbca', 'csus', 'cmca']
+        ,'pms_sec_type': ['cbca', 'csus', 'cmca']
     }))
     mock_held_sec.return_value.read = mock.Mock(return_value=pd.DataFrame({
         'lw_id': ['LW456', 'LW789']
-        ,'apx_sec_type': ['csus', 'cmca']
+        ,'pms_sec_type': ['csus', 'cmca']
     }))
     mock_appr.return_value.read_for_date = mock.Mock(return_value=pd.DataFrame({
         'ProprietarySymbol': []
     }))
     expected = pd.DataFrame({
         'lw_id': ['LW456']
-        ,'apx_sec_type': ['csus']
+        ,'pms_sec_type': ['csus']
     })
 
     # Act
@@ -607,7 +628,7 @@ def example_data():
     'lw_id': ['LW123']
 }))
 @mock.patch('flaskrp_helper.get_next_bday', return_value=date(2022,3,22))
-@mock.patch('flaskrp_helper.vPriceTable')
+@mock.patch('flaskrp_helper.vwPriceTable')
 @mock.patch('flaskrp_helper.PricingAuditTrailTable')
 def test_get_held_security_prices(mock_audit_table, mock_price_table, mock_gnb, mock_gmps, mock_ghs):
     # Arrange
@@ -721,8 +742,8 @@ def test_valid_with_null_dates():
     expected_length = 3
     df = pd.DataFrame({
         'col1': ['a', 'b', 'c'],
-        'valid_from': [pd.NaT, pd.NaT, pd.NaT],
-        'valid_to': [pd.NaT, pd.NaT, pd.NaT]
+        'valid_from_date': [pd.NaT, pd.NaT, pd.NaT],
+        'valid_to_date': [pd.NaT, pd.NaT, pd.NaT]
     })
     
     # Act
@@ -737,9 +758,9 @@ def test_valid_with_valid_dates():
     expected_set = {'b', 'd', 'e'}
     df = pd.DataFrame({
         'col1': ['a', 'b', 'c', 'd', 'e'],
-        'valid_from': [date(2022, 1, 1), date(2022, 2, 1)
+        'valid_from_date': [date(2022, 1, 1), date(2022, 2, 1)
             , date(2022, 3, 1), date(2022, 2, 1), None],
-        'valid_to': [date(2022, 1, 31), date(2022, 2, 28)
+        'valid_to_date': [date(2022, 1, 31), date(2022, 2, 28)
             , date(2022, 3, 31), None, date(2022, 4, 30)]
     })
     data_date = date(2022, 2, 1)
@@ -756,9 +777,9 @@ def test_valid_with_invalid_dates():
     expected_length = 0
     df = pd.DataFrame({
         'col1': ['a', 'b', 'c'],
-        'valid_from': [date(2022, 1, 1), 
+        'valid_from_date': [date(2022, 1, 1), 
             date(2022, 2, 1), date(2022, 3, 1)],
-        'valid_to': [date(2022, 1, 31), 
+        'valid_to_date': [date(2022, 1, 31), 
             date(2022, 2, 28), date(2022, 3, 31)]
     })
     data_date = date(2022, 4, 1)
@@ -1068,21 +1089,20 @@ def test_is_pending_when_ftp_upload_not_complete(monitor_table, fixed_datetime):
 @mock.patch('flaskrp_helper.is_delayed', return_value=(False, datetime(2022, 3, 20, 12, 0)))
 @mock.patch('flaskrp_helper.is_in_progress', return_value=(False, datetime(2022, 3, 20, 12, 0)))
 @mock.patch('flaskrp_helper.is_pending', return_value=(False, datetime(2022, 3, 20, 12, 0)))
-def test_get_pricing_feed_status_no_data(m1, m2, m3, m4, m5, monitor_table, fixed_datetime):
+def test_get_pricing_feed_status_no_status(m1, m2, m3, m4, m5, monitor_table, fixed_datetime):
     # Arrange
     expected_code = 200
-    expected_res = {
-        'status': 'warning'
-        , 'data': None
-        , 'message': 'No data was found.'
-    }
 
     # Act
     response, status_code = flaskrp_helper.get_pricing_feed_status()
 
     # Assert
     assert status_code == expected_code
-    assert response == expected_res
+    assert "data" in response
+    assert len(response["data"]) == len(flaskrp_helper.PRICING_FEEDS)
+    for pf in response["data"]:
+        assert "status" in response["data"][pf]
+        assert response["data"][pf]["status"] is None
 
 
 @mock.patch('flaskrp_helper.is_error', return_value=(True, datetime(2022, 3, 20, 12, 0)))
@@ -1091,7 +1111,8 @@ def test_get_pricing_feed_status_no_data(m1, m2, m3, m4, m5, monitor_table, fixe
 @mock.patch('flaskrp_helper.is_in_progress', return_value=(False, datetime(2022, 3, 20, 12, 0)))
 @mock.patch('flaskrp_helper.is_pending', return_value=(False, datetime(2022, 3, 20, 15, 0)))
 @mock.patch('flaskrp_helper.get_normal_eta', return_value=datetime(2022, 1, 1, 13, 30))
-def test_get_pricing_feed_status_error(m1, m2, m3, m4, m5, m6):
+@mock.patch('flaskrp_helper.get_feed_security_type', return_value='pf1 security type')
+def test_get_pricing_feed_status_error(m1, m2, m3, m4, m5, m6, m7):
     # Arrange
     expected_code = 200
     expected_res = {
@@ -1101,6 +1122,7 @@ def test_get_pricing_feed_status_error(m1, m2, m3, m4, m5, m6):
                 'status': 'ERROR'
                 , 'asofdate': datetime(2022, 3, 20, 12, 0).isoformat()
                 , 'normal_eta': datetime(2022, 1, 1, 13, 30).isoformat()
+                , 'security_type': 'pf1 security type'
             }
         }
         , 'message': None
@@ -1121,7 +1143,8 @@ def test_get_pricing_feed_status_error(m1, m2, m3, m4, m5, m6):
 @mock.patch('flaskrp_helper.is_in_progress', return_value=(False, datetime(2022, 3, 20, 12, 0)))
 @mock.patch('flaskrp_helper.is_pending', return_value=(False, datetime(2022, 3, 20, 15, 0)))
 @mock.patch('flaskrp_helper.get_normal_eta', return_value=datetime(2022, 1, 1, 13, 30))
-def test_get_pricing_feed_status_priced(m1, m2, m3, m4, m5, m6):
+@mock.patch('flaskrp_helper.get_feed_security_type', return_value='pf1 security type')
+def test_get_pricing_feed_status_priced(m1, m2, m3, m4, m5, m6, m7):
     # Arrange
     expected_code = 200
     expected_res = {
@@ -1131,6 +1154,7 @@ def test_get_pricing_feed_status_priced(m1, m2, m3, m4, m5, m6):
                 'status': 'PRICED'
                 , 'asofdate': datetime(2022, 3, 20, 13, 0).isoformat()
                 , 'normal_eta': datetime(2022, 1, 1, 13, 30).isoformat()
+                , 'security_type': 'pf1 security type'
             }
         }
         , 'message': None
@@ -1151,7 +1175,8 @@ def test_get_pricing_feed_status_priced(m1, m2, m3, m4, m5, m6):
 @mock.patch('flaskrp_helper.is_delayed', return_value=(False, datetime(2022, 3, 20, 14, 0)))
 @mock.patch('flaskrp_helper.is_pending', return_value=(False, datetime(2022, 3, 20, 15, 0)))
 @mock.patch('flaskrp_helper.get_normal_eta', return_value=datetime(2022, 1, 1, 13, 30))
-def test_get_pricing_feed_status_in_progress(m1, m2, m3, m4, m5, m6):
+@mock.patch('flaskrp_helper.get_feed_security_type', return_value='pf1 security type')
+def test_get_pricing_feed_status_in_progress(m1, m2, m3, m4, m5, m6, m7):
     # Arrange
     expected_code = 200
     expected_res = {
@@ -1161,6 +1186,7 @@ def test_get_pricing_feed_status_in_progress(m1, m2, m3, m4, m5, m6):
                 'status': 'IN PROGRESS'
                 , 'asofdate': datetime(2022, 3, 20, 12, 0).isoformat()
                 , 'normal_eta': datetime(2022, 1, 1, 13, 30).isoformat()
+                , 'security_type': 'pf1 security type'
             }
         }
         , 'message': None
@@ -1183,7 +1209,8 @@ def test_get_pricing_feed_status_in_progress(m1, m2, m3, m4, m5, m6):
 @mock.patch('flaskrp_helper.is_delayed', return_value=(True, datetime(2022, 3, 20, 14, 0)))
 @mock.patch('flaskrp_helper.is_pending', return_value=(False, datetime(2022, 3, 20, 15, 0)))
 @mock.patch('flaskrp_helper.get_normal_eta', return_value=datetime(2022, 1, 1, 13, 30))
-def test_get_pricing_feed_status_delayed(m1, m2, m3, m4, m5, m6):
+@mock.patch('flaskrp_helper.get_feed_security_type', return_value='pf1 security type')
+def test_get_pricing_feed_status_delayed(m1, m2, m3, m4, m5, m6, m7):
     # Arrange
     expected_code = 200
     expected_res = {
@@ -1193,6 +1220,7 @@ def test_get_pricing_feed_status_delayed(m1, m2, m3, m4, m5, m6):
                 'status': 'DELAYED'
                 , 'asofdate': datetime(2022, 3, 20, 14, 0).isoformat()
                 , 'normal_eta': datetime(2022, 1, 1, 13, 30).isoformat()
+                , 'security_type': 'pf1 security type'
             }
         }
         , 'message': None
@@ -1213,7 +1241,8 @@ def test_get_pricing_feed_status_delayed(m1, m2, m3, m4, m5, m6):
 @mock.patch('flaskrp_helper.is_delayed', return_value=(False, datetime(2022, 3, 20, 14, 0)))
 @mock.patch('flaskrp_helper.is_pending', return_value=(True, datetime(2022, 3, 20, 15, 0)))
 @mock.patch('flaskrp_helper.get_normal_eta', return_value=datetime(2022, 1, 1, 13, 30))
-def test_get_pricing_feed_status_pending(m1, m2, m3, m4, m5, m6):
+@mock.patch('flaskrp_helper.get_feed_security_type', return_value='pf1 security type')
+def test_get_pricing_feed_status_pending(m1, m2, m3, m4, m5, m6, m7):
     # Arrange
     expected_code = 200
     expected_res = {
@@ -1223,6 +1252,7 @@ def test_get_pricing_feed_status_pending(m1, m2, m3, m4, m5, m6):
                 'status': 'PENDING'
                 , 'asofdate': datetime(2022, 3, 20, 15, 0).isoformat()
                 , 'normal_eta': datetime(2022, 1, 1, 13, 30).isoformat()
+                , 'security_type': 'pf1 security type'
             }
         }
         , 'message': None
@@ -1440,15 +1470,15 @@ def test_add_duration_and_yield(example_prices):
 
 
 @mock.patch('flaskrp_helper.get_prices_file_path', return_value='\\\\dev-data\\lws$\\cameron\\lws\\var\\data\\pricing')
-@mock.patch('flaskrp_helper.vSecurityTable')
-@mock.patch('flaskrp_helper.APXvPriceTable')
+@mock.patch('flaskrp_helper.vwSecurityTable')
+@mock.patch('flaskrp_helper.vPriceTable')
 def test_prices_to_tab_delim_files(mock_apx_price, mock_sec, m1, fixed_date, example_prices):
     # Arrange
     mock_sec.return_value.read = mock.Mock(return_value=pd.DataFrame({
         'lw_id': ['ABC123', 'GHI789', 'DEF456']
-        ,'apx_sec_type': ['cbca', 'cmca', 'cbus']
-        ,'apx_symbol': ['ABC123', 'GHI789', 'DEF456']
-        ,'apx_security_id': ['111', '222', '333']
+        ,'pms_sec_type': ['cbca', 'cmca', 'cbus']
+        ,'pms_symbol': ['ABC123', 'GHI789', 'DEF456']
+        ,'pms_security_id': ['111', '222', '333']
     }))
     mock_apx_price.return_value.read = mock.Mock(return_value=pd.DataFrame({
         'SecurityID': [], 'PriceTypeID': []
@@ -1503,12 +1533,36 @@ def test_get_normal_eta_invalid_feed():
     assert result == expected
 
 
+def test_get_feed_security_type():
+    # Arrange
+    expected = 'pf1 security type'
+    with mock.patch('flaskrp_helper.PRICING_FEEDS', {'pf1': {'security_type': 'pf1 security type'}}):
+
+        # Act
+        result = flaskrp_helper.get_feed_security_type('pf1')
+
+    # Assert
+    assert result == expected
+
+
+def test_get_feed_security_type_invalid_feed():
+    # Arrange
+    expected = None
+    with mock.patch('flaskrp_helper.PRICING_FEEDS', {'pf1': {'security_type': 'pf1 security type'}}):
+
+        # Act
+        result = flaskrp_helper.get_feed_security_type('pf2')
+
+    # Assert
+    assert result == expected
+
+
 def test_is_different_from_apx_price_different_source():
     # Arrange
     expected = True
     px = {'apx_symbol': 'ABC', 'apx_security_id': '123', 'source': 'BLOOMBERG', 'price': 123.456}
     pt = 'price'
-    secs = pd.DataFrame({'apx_symbol': ['ABC'], 'apx_security_id': ['123']})
+    secs = pd.DataFrame({'pms_symbol': ['ABC'], 'pms_security_id': ['123']})
     apx_pxs = pd.DataFrame({'SecurityID': [123], 'PriceTypeID': [1], 'SourceID': [3006], 'PriceValue': 123.456})
 
     # Act
@@ -1523,7 +1577,7 @@ def test_is_different_from_apx_price_different_price():
     expected = True
     px = {'apx_symbol': 'ABC', 'apx_security_id': '123', 'source': 'BLOOMBERG', 'price': 123.456}
     pt = 'price'
-    secs = pd.DataFrame({'apx_symbol': ['ABC'], 'apx_security_id': ['123']})
+    secs = pd.DataFrame({'pms_symbol': ['ABC'], 'pms_security_id': ['123']})
     apx_pxs = pd.DataFrame({'SecurityID': [123], 'PriceTypeID': [1], 'SourceID': [3004], 'PriceValue': 456.123})
 
     # Act
@@ -1538,7 +1592,7 @@ def test_is_different_from_apx_price_same():
     expected = False
     px = {'apx_symbol': 'ABC', 'apx_security_id': '123', 'source': 'BLOOMBERG', 'price': 123.456}
     pt = 'price'
-    secs = pd.DataFrame({'apx_symbol': ['ABC'], 'apx_security_id': ['123']})
+    secs = pd.DataFrame({'pms_symbol': ['ABC'], 'pms_security_id': ['123']})
     apx_pxs = pd.DataFrame({'SecurityID': [123], 'PriceTypeID': [1], 'SourceID': [3004], 'PriceValue': 123.456})
 
     # Act
@@ -1553,7 +1607,7 @@ def test_is_different_from_apx_price_sec_not_found():
     expected = False
     px = {'apx_symbol': 'ABC', 'apx_security_id': '123', 'source': 'BLOOMBERG', 'price': 123.456}
     pt = 'price'
-    secs = pd.DataFrame({'apx_symbol': ['ABC'], 'apx_security_id': ['999']})
+    secs = pd.DataFrame({'pms_symbol': ['ABC'], 'pms_security_id': ['999']})
     apx_pxs = pd.DataFrame({'SecurityID': [999], 'PriceTypeID': [1], 'SourceID': [3004], 'PriceValue': 123.456})
 
     # Act
