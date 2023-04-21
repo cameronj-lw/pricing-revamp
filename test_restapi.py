@@ -31,7 +31,7 @@ def success_with_no_data(response):
 @pytest.mark.end2end
 def test_get_price_by_date():
     # Send a GET request to the endpoint with a valid date
-    response = requests.get(f'{BASE_URL}/pricing/price/20230103')
+    response = requests.get(f'{BASE_URL}/pricing/price/20230420')
     # Verify that the response is successful
     success_with_data(response)
 
@@ -209,12 +209,16 @@ def test_get_pricing_feed_status_by_date():
 @pytest.mark.end2end
 def test_get_pricing_feed_status_by_date_warning():
     response = requests.get(f'{BASE_URL}/pricing/feed-status/19230104')
+    print(response)
     if response.json()["data"] is not None:
         # If test is ran later in the day, feeds may have "delayed" status.
         # In this case, we should not use the generic success_with_no_data function,
         # but rather do our own assertions here for each feed in the response:
         for f in response.json()["data"]:
-            assert response.json()["data"][f]["status"] == "DELAYED"
+            # If ran before the "normal_eta" time, status may be none.
+            # But if there is a status, it should be "delayed":
+            if response.json()["data"][f]["status"] is not None:
+                assert response.json()["data"][f]["status"] == "DELAYED"
     else:
         success_with_no_data(response)
 
@@ -471,12 +475,12 @@ def test_pricing_column_config():
     data = {
         "columns": [
             {
-                "name": "column1",
-                "hidden": True
+                "column_name": "column1",
+                "is_hidden": True
             },
             {
-                "name": "column2",
-                "hidden": False
+                "column_name": "column2",
+                "is_hidden": False
             }
         ]
     }
