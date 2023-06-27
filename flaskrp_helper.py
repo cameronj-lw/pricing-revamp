@@ -24,12 +24,12 @@ import pymsteams
 from sqlalchemy import exc, text, update
 from sqlalchemy.orm import Session
 
-# Import LW libs ( PF version )
-# TODO_PROD: better way to do this - detect environment somehow? 
-if os.environ.get('pythonpath') is None:
-    pythonpath = '\\\\dev-data\\lws$\\cameron\\lws\\libpy\\lib'
-    os.environ['pythonpath'] = pythonpath
-    sys.path.append(pythonpath)
+# # Import LW libs ( PF version )
+# # TODO_PROD: better way to do this - detect environment somehow? 
+# if os.environ.get('pythonpath') is None:
+#     pythonpath = '\\\\dev-data\\lws$\\cameron\\lws\\libpy\\lib'
+#     os.environ['pythonpath'] = pythonpath
+#     sys.path.append(pythonpath)
 
 from lw import config
 from lw.core.command import BaseCommand
@@ -53,7 +53,7 @@ from lw.db.mgmtdb.monitor import MonitorTable
 from lw.db.lwdb.apx_appraisal import ApxAppraisalTable
 # from lw.util.dataframe import NaN_NaT_to_none
 from lw.util.date import format_time, get_current_bday, get_previous_bday, get_next_bday
-from lw.util.file import prepare_dated_file_path
+from lw.util.file import prepare_dated_file_path, prepare_file_path
 
 
 # globals
@@ -63,6 +63,7 @@ api = Api(app)
 CORS(app)
 
 
+# TODO_LAYER: Application layer, possibly subclass of Domain layer class
 PRICING_FEEDS = {
     'FTSE': {
         'FTP_DOWNLOAD': [
@@ -75,8 +76,11 @@ PRICING_FEEDS = {
         'LOAD2PRICING': [
             ('FTSETMX_PX', ['PostProcess'])
         ],
+        'LOAD2APX': [
+            ('APX-PRICELOAD', ['BOND_FTSETMX'])
+        ],
         'security_type': 'Canadian Bonds',
-        'normal_eta': datetime.today().replace(hour=14, minute=15)
+        'normal_eta': '{today}T14:15:00.000000'
     },
     'MARKIT': {
         'FTP_UPLOAD': [
@@ -91,8 +95,27 @@ PRICING_FEEDS = {
         'LOAD2PRICING': [
             ('MARKIT_PRICE', ['MARKIT_PRICE'])
         ],
+        'LOAD2APX': [
+            ('APX-PRICELOAD', ['MARKIT_PRICE'])
+        ],
         'security_type': 'American Bonds',
-        'normal_eta': datetime.today().replace(hour=13, minute=30)
+        'normal_eta': '{today}T13:30:00.000000'
+    },
+    'MARKIT_LOAN': {
+        'FTP_DOWNLOAD': [
+            ('FTP-MARKIT_LOAN', ['MARKIT_LOAN_ACCRUED','MARKIT_LOAN_CASH','MARKIT_LOAN_CASH_30D','MARKIT_LOAN_CONTRACT','MARKIT_LOAN_POSITION','MARKIT_LOAN_SECURITY'])
+        ],
+        'LOAD2LW': [
+            ('MARKIT_LOAN', ['MARKIT_LOAN_PRICE'])
+        ],
+        'LOAD2PRICING': [
+            ('MARKIT_LOAN', ['MARKIT_LOAN_PRICE'])
+        ],
+        'LOAD2APX': [
+            ('APX-PRICELOAD', ['MARKIT_LOAN_PRICE'])
+        ],
+        'security_type': 'American Loans',
+        'normal_eta': '{today}T14:00:00.000000'
     },
     'FUNDRUN': {
         'FTP_UPLOAD': [
@@ -107,8 +130,11 @@ PRICING_FEEDS = {
         'LOAD2PRICING': [
             ('FUNDRUN', ['EQUITY_PRICE_MAIN'])
         ],
+        'LOAD2APX': [
+            ('APX-PRICELOAD', ['EQUITY_FUNDRUN_MAIN'])
+        ],
         'security_type': 'All Equities (except Latin America)',
-        'normal_eta': datetime.today().replace(hour=13, minute=45)
+        'normal_eta': '{today}T13:45:00.000000'
     },
     'FUNDRUN_LATAM': {
         'FTP_UPLOAD': [
@@ -123,28 +149,36 @@ PRICING_FEEDS = {
         'LOAD2PRICING': [
             ('FUNDRUN', ['EQUITY_PRICE_LATAM'])
         ],
+        'LOAD2APX': [
+            ('APX-PRICELOAD', ['EQUITY_FUNDRUN_LATAM'])
+        ],
         'security_type': 'Latin America Equities',
-        'normal_eta': datetime.today().replace(hour=14, minute=00)
+        'normal_eta': '{today}T14:00:00.000000'
     },
     'BLOOMBERG': { 
         'BB_SNAP': [
-            ('BB-SNAP', ['BOND_PRICE'])
+            ('BB-SNAP', ['BOND_PRICE', 'MBS_PRICE'])
         ],
         'LOAD2PRICING': [
-            ('LOADPRICE_FI', ['BOND_PRICE'])
+            ('LOADPRICE_FI', ['BOND_PRICE', 'MBS_PRICE'])
+        ],
+        'LOAD2APX': [
+            ('APX-PRICELOAD', ['BOND_BB'])
         ],
         'security_type': 'All Instruments',
-        'normal_eta': datetime.today().replace(hour=14, minute=30)
+        'normal_eta': '{today}T14:30:00.000000'
     },
 }
 
 # TODO_PROD: consider changing references to APX to PMS
+# TODO_LAYER: Application
 APX_SEC_TYPES = {
     # TODO_TO: confirm if desired
     'bond': ['cb', 'cf', 'cm', 'cv', 'fr', 'lb', 'ln', 'sf', 'tb', 'vm'],
     'equity': ['cc', 'ce', 'cg', 'ch', 'ci', 'cj', 'ck', 'cn', 'cr', 'cs', 'ct', 'cu', 'ps']
 }
 
+# TODO_LAYER: Application... or infra since it's driven by IMEX formatting?
 APX_PRICE_TYPES = {
     'price': {
         'price_type_id': 1,  # Standard Prices
@@ -160,6 +194,8 @@ APX_PRICE_TYPES = {
     }
 }
 
+# TODO_LAYER: Application, possibly subclass of Domain class
+# ... or infra since it's driven by APX values?
 APX_PX_SOURCES = {
     # TODO: create new sources for manual/override; add to below
     # 'LWDB source': APX source ID   # APX source name
@@ -177,6 +213,7 @@ APX_PX_SOURCES = {
     'OVERRIDE'              : 3032,  # LW Security Pricing - Override
 }
 
+# TODO_LAYER: Application
 PRICE_HIERARCHY = RELEVANT_PRICES = [
     # highest to lowest in the hierarchy, i.e. MANUAL is highest
     # TODO_IDEA: should add more pricing sources to "hierarchy"? 
@@ -186,11 +223,13 @@ PRICE_HIERARCHY = RELEVANT_PRICES = [
 
 LOG_TIMESTAMPS = False
 
+# TODO_LAYER: Infra
 IMEX_BASE_URL = 'http://TEST-WS003:5000/api'
 
 
 # Classes
 
+# TODO_LAYER: Domain???
 class SecurityNotFoundException(Exception):
     def __init__(self, missing_col_name, missing_col_value):
         self.missing_col_name = missing_col_name
@@ -198,6 +237,7 @@ class SecurityNotFoundException(Exception):
 
 
 
+# TODO_LAYER: move into libpy?
 def NaN_NaT_to_none(df: pd.DataFrame) -> pd.DataFrame:
     """
     Replace NaN and NaT values in the provided DataFrame with None.
@@ -208,6 +248,7 @@ def NaN_NaT_to_none(df: pd.DataFrame) -> pd.DataFrame:
     # df = df.fillna(None)
     return df
 
+# TODO_LAYER: Interface
 def clean(df: pd.DataFrame) -> str:
     """
     Clean and format a DataFrame and returns the results as a JSON string.
@@ -235,6 +276,7 @@ def clean(df: pd.DataFrame) -> str:
     res_str = jsonify(res_dict)
     return res_str  # res_str
 
+# TODO_LAYER: Application, or interface?
 def trim_px_sources(raw_prices: pd.DataFrame) -> pd.DataFrame:
     """
     Trim the sources in a DataFrame of prices based on a set of predetermined rules and returns the result.
@@ -245,7 +287,7 @@ def trim_px_sources(raw_prices: pd.DataFrame) -> pd.DataFrame:
     Returns:
     - DataFrame: The processed DataFrame with sources trimmed according to the rules.
     """
-    prices = raw_prices
+    prices = raw_prices.copy()
     prices['source'] = prices['source'].apply(lambda x: 'BLOOMBERG' if (x[:3] == 'BB_' and '_DERIVED' not in x) else x)
     prices['source'] = prices['source'].apply(lambda x: 'FTSE' if x == 'FTSETMX_PX' else x)
     prices['source'] = prices['source'].apply(lambda x: 'MARKIT' if x == 'MARKIT_LOAN_CLEANPRICE' else x)
@@ -256,6 +298,7 @@ def trim_px_sources(raw_prices: pd.DataFrame) -> pd.DataFrame:
     prices = prices.reset_index(drop=True)
     return prices
 
+# TODO_LAYER: Application ... maybe subclass of Domain class?
 def get_chosen_price(prices: pd.DataFrame) -> pd.DataFrame:
     """
     Returns the preferred price for a set of prices based on the predetermined hierarchy.
@@ -283,7 +326,8 @@ def get_chosen_price(prices: pd.DataFrame) -> pd.DataFrame:
     chosen_px = chosen_px.reset_index(drop=True)
     return chosen_px
 
-def get_manual_pricing_securities(data_date=date.today()):
+# TODO_LAYER: Infrastructure
+def get_manual_pricing_securities():
     """
     Gets securities which we want to always price manually,
         even when we have external prices available.
@@ -295,10 +339,11 @@ def get_manual_pricing_securities(data_date=date.today()):
     - DataFrame: Securities which we always want to price manually.
     """
     secs = PricingManualPricingSecurityTable().read()
-    valid_secs = valid(secs, data_date)
+    valid_secs = not_deleted(secs)
     valid_secs = valid_secs.reset_index(drop=True)
     return valid_secs
 
+# TODO_LAYER: Application?
 def is_manual(prices):
     """
     Determines if the security with the prices provided in the DataFrame was manually priced.
@@ -317,6 +362,7 @@ def is_manual(prices):
     else:
         return False
 
+# TODO_LAYER: Application?
 def is_missing(prices):
     """
     Determines if the security with the prices provided in the DataFrame is a security missing price.
@@ -335,7 +381,7 @@ def is_missing(prices):
     else:
         return True
 
-
+# TODO_LAYER: Application?
 def is_override(prices):
     """
     Determines if the security with the prices provided in the DataFrame has an overridden price.
@@ -350,7 +396,7 @@ def is_override(prices):
     """
     return (~is_missing(prices) and is_manual(prices))
 
-
+# TODO_LAYER: Application?
 def first2chars(s):
     """
     Returns the first two characters of the provided string.
@@ -360,7 +406,7 @@ def first2chars(s):
     else:
         return s[:2]
 
-
+# TODO_LAYER: Infrastructure?
 def add_valid_dates(payload):
     """
     Adds valid_from and valid_to fields to a dictionary or DataFrame.
@@ -373,9 +419,10 @@ def add_valid_dates(payload):
     """
     payload['valid_from_date'] = date.today()
     payload['valid_to_date'] = None
+    payload['is_deleted'] = False
     return payload
 
-
+# TODO_LAYER: Infrastructure?
 def add_asof(payload):
     """
     Adds modified_at and modified_by fields to a dictionary or DataFrame.
@@ -391,9 +438,10 @@ def add_asof(payload):
             payload['modified_by'] = payload['asofuser']
         else:
             payload['modified_by'] = f"{os.getlogin()}_{socket.gethostname()}"
-    payload['modified_at'] = format_time(datetime.now())
+    payload['modified_at'] = datetime.now().isoformat()[:-3]
     return payload
 
+# TODO_LAYER: Application
 def get_securities_by_sec_type(secs, sec_type=None, sec_type_col='pms_sec_type', sec_type_func=first2chars):
     """
     Filters securities DataFrame by security type.
@@ -407,6 +455,7 @@ def get_securities_by_sec_type(secs, sec_type=None, sec_type_col='pms_sec_type',
     Returns:
     - DataFrame: Filtered 'secs' DataFrame.
     """
+    logging.info(f"Filtering {secs.index} secs for {sec_type} using {sec_type_col}... cols: {secs.columns}")
     if sec_type is None:
         return secs
     if isinstance(sec_type, str):  # convert to list
@@ -423,6 +472,64 @@ def get_securities_by_sec_type(secs, sec_type=None, sec_type_col='pms_sec_type',
             result = secs[processed_sec_types.isin(sec_type)]
             return result.reset_index(drop=True)
 
+# TODO_LAYER: Application
+def get_securities_by_source(secs, source=None):
+    """
+    Filters securities DataFrame by source.
+
+    Args:
+    - secs (DataFrame): DataFrame containing securities.
+    - source (str, optional): Security type(s) to filter by. If not provided, do not filter.
+    
+    Returns:
+    - DataFrame: Filtered 'secs' DataFrame.
+    """
+    if source is None:
+        return secs
+    if source.upper() in ('FAVOURITE', 'FAVORITE', 'SAVED'):
+        manually_priced_secs = get_manual_pricing_securities()
+        result = secs[secs['lw_id'].isin(manually_priced_secs['lw_id'].tolist())]
+        return result
+    if source.upper() == 'MISSING':
+        result = secs[secs['chosen_price'].isnull()]
+        return result
+    # If we made it here, it means a specific source was requested.
+    # Filter for securities with chosen price from that source:
+    result = secs[~secs['chosen_price'].isnull()]
+    result = result[result['chosen_price'].apply(lambda x: x['source'] == source.upper())]
+    return result
+
+# TODO_LAYER: Interface / Infrastructure
+def rename_keys_pms2apx(d):
+    """
+    Renames dict keys with "pms_" prefix by replacing it with "apx_" prefix.
+    
+    Args:
+    - d (dict): dict with keys to be renamed.
+    
+    Returns:
+    - dict: dict with renamed columns.
+    """
+    # Replace pms_ prefix with apx_
+    res_dict = {('apx_' + k[4:] if k[0:4] == 'pms_' else k):v for (k,v) in d.items()}
+    return res_dict
+
+# TODO_LAYER: Interface / Infrastructure
+def rename_cols_apx2pms(df):
+    """
+    Renames df columns with "apx_" prefix by replacing it with "pms_" prefix.
+    
+    Args:
+    - df (DataFrame): df with columns to be renamed.
+    
+    Returns:
+    - DataFrame: df with renamed columns.
+    """
+    res_df = df.copy()
+    res_df = res_df.rename(columns=lambda x: 'pms_' + x[4:] if x[0:4] == 'apx_' else x)
+    return res_df
+
+# TODO_LAYER: Interface / Infrastructure
 def rename_cols_pms2apx(df):
     """
     Renames df columns with "pms_" prefix by replacing it with "apx_" prefix.
@@ -437,7 +544,8 @@ def rename_cols_pms2apx(df):
     res_df = res_df.rename(columns=lambda x: 'apx_' + x[4:] if x[0:4] == 'pms_' else x)
     return res_df
 
-def get_held_sec_price_counts_by_source(curr_bday, sec_type=None):
+# TODO_LAYER: Application + Domain?
+def get_held_sec_price_counts_by_source(curr_bday, sec_type=None, use_read_models=False):
     """
     For a given date, retrieves the breakdown of how many held securities
         have their "chosen price" from each source, optionally filtering by security type.
@@ -445,11 +553,33 @@ def get_held_sec_price_counts_by_source(curr_bday, sec_type=None):
     Args:
     - curr_bday (str): Date to retrieve held securities for (in YYYYMMDD format).
     - sec_type (str or list, optional): Security type(s) to filter by.
+    - use_read_models ()
 
     Returns:
     - dict: Counts by source. Keys are sources, values are counts.
     """
     source_counts = {}
+    if use_read_models:
+        # Get held security prices. Then use chosen prices from there.
+        resp = get_held_security_prices(curr_bday, prev_bday=None, sec_type=sec_type, source=None, use_read_models=True)
+        secs_with_prices = resp.json['data']
+        for sec in secs_with_prices:
+            if 'chosen_price' in sec:
+                if sec['chosen_price'] is None:
+                    chosen_source = 'MISSING'
+                else:
+                    chosen_source = sec['chosen_price']['source']
+                # Increment, or create if not already there:
+                if chosen_source in source_counts:
+                    source_counts[chosen_source] += 1
+                else:
+                    source_counts[chosen_source] = 1
+        return {
+            'data': source_counts,
+            'message': None,
+            'status': 'success'
+        }
+                    
     held = get_held_securities(curr_bday, sec_type)
     prices = vwPriceTable().read(data_date=curr_bday)
     prices = trim_px_sources(prices)
@@ -469,6 +599,24 @@ def get_held_sec_price_counts_by_source(curr_bday, sec_type=None):
             source_counts[chosen_source] = 1
     return source_counts
 
+# TODO_LAYER: Application
+def get_held_securities_id_col(curr_bday, sec_type=None, id_col='lw_id'):
+    """
+    Retrieves column values for held securities for a given date, optionally filtering by security type.
+
+    Args:
+    - curr_bday (str): Date to retrieve held securities for (in YYYYMMDD format).
+    - sec_type (str or list, optional): Security type(s) to filter by.
+    - id_col (str): column to return values of.
+
+    Returns:
+    - list: values of the id_col for held securities.
+    """
+    held = get_held_securities(curr_bday, sec_type)
+    ids = held[id_col].values.tolist()
+    return ids
+
+# TODO_LAYER: Application + Domain?
 def get_held_securities(curr_bday, sec_type=None):
     """
     Retrieves held securities for a given date, optionally filtering by security type.
@@ -484,7 +632,7 @@ def get_held_securities(curr_bday, sec_type=None):
     if len(curr_bday_appr.index):  # if there are Appraisal results for curr day, use it
         secs = vwSecurityTable().read()
         secs = get_securities_by_sec_type(secs, sec_type)
-        held_secs = list(curr_bday_appr['ProprietarySymbol'])
+        held_secs = list(curr_bday_appr['lw_id'])
         held = secs[secs['lw_id'].isin(held_secs)]
     else:  # if not, use live positions
         held = vwHeldSecurityTable().read()
@@ -493,7 +641,8 @@ def get_held_securities(curr_bday, sec_type=None):
     held = held.reset_index(drop=True)
     return held
 
-def add_prices(held, i, lw_id, curr_prices, prev_prices):
+# TODO_LAYER: Application, using subclass of Domain class?
+def add_prices(held, i, lw_id, curr_prices, prev_prices, use_read_models=False, data_date=None):
     """
     Add price information to a held security row.
 
@@ -508,6 +657,22 @@ def add_prices(held, i, lw_id, curr_prices, prev_prices):
     - DataFrame: Modified 'held' DataFrame containing prices.
     - DataFrame: Combined provided prices for current bday and previous bday.
     """
+    if use_read_models:
+        for rm_name in ['curr_bday_prices', 'prev_bday_price', 'chosen_price']:
+            if rm_name not in held:
+                held[rm_name] = None
+                held[rm_name] = held[rm_name].astype(object)
+            held.at[i, rm_name] = None
+            # folder_name = get_read_model_folder(data_date, rm_name)
+            # file_name = f'{lw_id}.json'
+            # json_file = os.path.join(folder_name, file_name)
+            # if os.path.isfile(json_file):
+            #     with open(json_file, 'r') as f:
+            #         curr = json.loads(f.read())
+            #     held.at[i, rm_name] = curr
+            rm_content = get_read_model_content(rm_name, file_name=lw_id, data_date=data_date)
+            held.at[i, rm_name] = rm_content
+        return held
     sec_curr_prices = curr_prices.loc[curr_prices['lw_id'] == lw_id]
     sec_prev_prices = prev_prices.loc[prev_prices['lw_id'] == lw_id]
     # add prices:
@@ -540,7 +705,8 @@ def add_prices(held, i, lw_id, curr_prices, prev_prices):
                 held.at[i, 'chosen_price'] = held.at[i, 'chosen_price'][0]
     return held
 
-def add_audit_trail(held, i, lw_id, curr_audit_trail):
+# TODO_LAYER: Application, using Domain class?
+def add_audit_trail(held, i, lw_id, curr_audit_trail, use_read_models=False, data_date=None):
     """
     Add audit trail information to a held security row.
 
@@ -560,6 +726,11 @@ def add_audit_trail(held, i, lw_id, curr_audit_trail):
         held['audit_trail'] = None
     if held.dtypes['audit_trail'] != object:
         held['audit_trail'] = held['audit_trail'].astype(object)
+    if use_read_models:
+        rm_content = get_read_model_content('audit_trail', lw_id, data_date)
+        held.at[i, 'audit_trail'] = rm_content
+        return held
+
     sec_curr_audit = curr_audit_trail.loc[curr_audit_trail['lw_id'] == lw_id]
     if len(sec_curr_audit):
         sec_curr_audit = NaN_NaT_to_none(sec_curr_audit)
@@ -604,6 +775,7 @@ def add_audit_trail(held, i, lw_id, curr_audit_trail):
 #     # If we made it here, the sec should not be excluded
 #     return False
 
+# TODO_LAYER: Application
 def should_exclude_sec(chosen_price_source, source=None):
     """
     Determine whether a security should be excluded based on pricing information.
@@ -680,7 +852,8 @@ def should_exclude_sec(chosen_price_source, source=None):
 #     return clean(held)
 
 
-def get_held_security_prices(curr_bday, prev_bday, sec_type=None, source=None):
+# TODO_LAYER: Application, using Domain class(es)?
+def get_held_security_prices(curr_bday, prev_bday, sec_type=None, source=None, use_read_models=False):
     """
     Retrieve held securities with price and audit trail information for the provided
     current and previous business days, optionally filtered by security type and/or price type.
@@ -698,15 +871,32 @@ def get_held_security_prices(curr_bday, prev_bday, sec_type=None, source=None):
     """
     if LOG_TIMESTAMPS:
         logging.info(f"Start get_held_security_prices {datetime.now()}")
+    if use_read_models:
+        res = get_read_model_content('held_securities_with_prices', file_name='held', data_date=curr_bday)
+        # lw_ids = get_held_securities_id_col(curr_bday, sec_type, id_col='lw_id')
+        # res = []
+        # for lw_id in lw_ids:
+        #     sec = get_read_model_content('security_with_prices', file_name=lw_id, data_date=curr_bday)
+        #     res.append(sec)
+        # Just in case there are null records ... this would cause issues when converting to a df
+        res = [d for d in res if d is not None]
+        res_df = pd.DataFrame(res)
+        res_df = get_securities_by_sec_type(res_df, sec_type, sec_type_col='apx_sec_type')
+        res_df = get_securities_by_source(res_df, source)
+        res_df['good_thru_date'] = get_next_bday(curr_bday).isoformat()
+        # res_df = add_audit_trail(res_df, i, lw_id, curr_audit_trail=None, use_read_models=True, data_date=curr_bday)
+        return clean(res_df)
+        curr_prices = prev_prices = None
+    else:
+        curr_prices = vwPriceTable().read(data_date=curr_bday)
+        curr_prices = trim_px_sources(curr_prices)
+        # want to include only 1 prev day px: the one from APX
+        prev_prices = vwPriceTable().read(data_date=prev_bday, source='PXAPX')
+        prev_prices['source'] = 'APX'
     held = get_held_securities(curr_bday, sec_type)
     if LOG_TIMESTAMPS:
         logging.info(f"Got held securities {datetime.now()}")
     held['prices'] = None
-    curr_prices = vwPriceTable().read(data_date=curr_bday)
-    curr_prices = trim_px_sources(curr_prices)
-    # want to include only 1 prev day px: the one from APX
-    prev_prices = vwPriceTable().read(data_date=prev_bday, source='PXAPX')
-    prev_prices['source'] = 'APX'
     curr_audit_trail = PricingAuditTrailTable().read(data_date=curr_bday)
     if source == 'FAVOURITE':
         manually_priced_secs = get_manual_pricing_securities()
@@ -722,7 +912,7 @@ def get_held_security_prices(curr_bday, prev_bday, sec_type=None, source=None):
             else:
                 # logging.info(f'keeping sticky bond {lw_id}')
                 pass
-        held = add_prices(held, i, lw_id, curr_prices, prev_prices)
+        held = add_prices(held, i, lw_id, curr_prices, prev_prices, use_read_models, data_date=curr_bday)
         # remove this security according to type, if requested
         chosen_price = held.at[i, 'chosen_price']
         chosen_price_source = None
@@ -741,7 +931,9 @@ def get_held_security_prices(curr_bday, prev_bday, sec_type=None, source=None):
     return clean(held)
 
 
-def get_counts_by_source(curr_bday, sec_type=None):
+# TODO_LAYER: Application
+def get_counts_by_source(curr_bday, sec_type=None, use_read_models=False):
+    # TODO_CLEANUP: delete when not needed
     """
     Retrieve how many held securities are currently priced 
 
@@ -753,7 +945,7 @@ def get_counts_by_source(curr_bday, sec_type=None):
     - JSON string of held securities with price and audit trail information, along with status and message if applicable.
     """
     if LOG_TIMESTAMPS:
-        logging.info(f"Start get_held_security_prices {datetime.now()}")
+        logging.info(f"Start get_counts_by_source {datetime.now()}")
     held = get_held_securities(curr_bday, sec_type)
     if LOG_TIMESTAMPS:
         logging.info(f"Got held securities {datetime.now()}")
@@ -784,14 +976,13 @@ def get_counts_by_source(curr_bday, sec_type=None):
         if should_exclude_sec(chosen_price_source, source):
             held = held.drop(i)
             continue
-        # add audit trail:
-        held = add_audit_trail(held, i, lw_id, curr_audit_trail)
     if LOG_TIMESTAMPS:
-        logging.info(f"Finish get_held_security_prices {datetime.now()}")
+        logging.info(f"Finish get_counts_by_source {datetime.now()}")
     # TODO_WAVE2: make good thru date based on sec type / applicable holiday calendar
     held['good_thru_date'] = get_next_bday(curr_bday)
     return clean(held)
 
+# TODO_LAYER: Application, using Domain class? Or Infra?
 def get_pricing_attachment_folder(data_date):
     """
     Retrieve the path to the folder containing pricing attachments for a given date.
@@ -806,6 +997,7 @@ def get_pricing_attachment_folder(data_date):
     full_path = prepare_dated_file_path(folder_name=base_path, date=datetime.strptime(data_date, '%Y%m%d'), file_name='', rotate=False)
     return full_path
 
+# TODO_LAYER: Infra. Possibly joint effort with also Application/Interface
 def save_binary_files(data_date, files):
     """
     Save binary files to the folder corresponding to data_date.
@@ -847,6 +1039,7 @@ def save_binary_files(data_date, files):
             'message': f'No files were provided, so there is nothing to save.'
         }, 200
 
+# TODO_LAYER: Infra. Possibly joint effort with also Application/Interface
 def delete_dir_contents(path):
     """
     Delete all files in a given directory.
@@ -876,6 +1069,24 @@ def delete_dir_contents(path):
             'message': msg
         }, 500
 
+# TODO_LAYER: Application, using Domain class attributes?
+def not_deleted(df):
+    """
+    Filter a pandas dataframe to include only rows whose "is_deleted" are False, or null.
+
+    Args:
+    - df (pandas.DataFrame): The dataframe to be filtered.
+
+    Returns:
+    - pandas.DataFrame: A new dataframe containing only rows whose "is_deleted" are False, or null.
+    """
+    # TODO_REFACTOR: does this belong in a library?
+    if 'is_deleted' not in df:
+        return df
+    res = df[df['is_deleted'] == False]
+    return res
+
+# TODO_LAYER: Application, using Domain class attributes?
 def valid(df, data_date=date.today()):  
     """
     Filter a pandas dataframe to include only rows whose 'valid_from' and 'valid_to' date ranges
@@ -889,6 +1100,9 @@ def valid(df, data_date=date.today()):
     - pandas.DataFrame: A new dataframe containing only rows whose 'valid_from' and 'valid_to' date ranges
                         include the specified date, or are null.
     """
+    res = not_deleted(df)
+    return res
+    # TODO_CLEANUP: delete this function, once confirmed using "not_deleted" instead
     # TODO_REFACTOR: does this belong in a library?
     valid_from = [
         pd.isnull(df['valid_from_date']), df['valid_from_date'] <= np.datetime64(data_date)
@@ -896,9 +1110,11 @@ def valid(df, data_date=date.today()):
     valid_to = [
         pd.isnull(df['valid_to_date']), df['valid_to_date'] >= np.datetime64(data_date)
     ]
-    res = df.loc[valid_from[0] | valid_from[1]].loc[valid_to[0] | valid_to[1]]
-    return res
+    res1 = df.loc[valid_from[0] | valid_from[1]]
+    res2 = res1.loc[valid_to[0] | valid_to[1]]
+    return res2
 
+# TODO_LAYER: Application, using Domain class attributes?
 def save_df_to_table(df, table):
     """
     Save a pandas dataframe to a database table using the specified table object's bulk_insert method.
@@ -913,7 +1129,11 @@ def save_df_to_table(df, table):
     """
     try:
         res = table.bulk_insert(df)
-        if res.rowcount == len(df.index):
+        if isinstance(res, int):
+            row_cnt = res
+        else:
+            row_cnt = res.rowcount
+        if row_cnt == len(df.index):
             return {
                 'status': 'success',
                 'data': None,
@@ -921,10 +1141,10 @@ def save_df_to_table(df, table):
                 # f"{config.CONN_INFO[table.database_key][config.ENV]['hostname']}." \
                 # f"{config.CONN_INFO[table.database_key][config.ENV]['database']}." \
                 # f"{table.schema}.{table.table_name}"
-                'message': f"Successfully saved {res.rowcount} row{'' if res.rowcount == 1 else 's'}."
+                'message': f"Successfully saved {row_cnt} row{'' if row_cnt == 1 else 's'}."
             }, 201
         else:
-            msg = f'Expected {len(df.index)} rows to be saved, but there were {res.rowcount}!'
+            msg = f'Expected {len(df.index)} rows to be saved, but there were {row_cnt}!'
             logging.error(msg)
             return {
                 'status': 'error',
@@ -978,8 +1198,8 @@ def is_priced(pf, data_date):
             was detected).
     """
     max_ts = datetime.fromordinal(1)  # beginning of time
-    if 'LOAD2PRICING' in PRICING_FEEDS[pf]:
-        for (rg, rns) in PRICING_FEEDS[pf]['LOAD2PRICING']:
+    if 'LOAD2APX' in PRICING_FEEDS[pf]:
+        for (rg, rns) in PRICING_FEEDS[pf]['LOAD2APX']:
             for rn in rns:
                 mon = MonitorTable().read(scenario=MonitorTable().base_scenario, data_date=data_date, run_group=rg, run_name=rn, run_type='RUN')
                 complete = mon[mon['run_status'] == 0]
@@ -1041,7 +1261,8 @@ def get_normal_eta(pf):
     """
     if pf in PRICING_FEEDS:
         if 'normal_eta' in PRICING_FEEDS[pf]:
-            return PRICING_FEEDS[pf]['normal_eta']
+            eta_iso = PRICING_FEEDS[pf]['normal_eta'].format(today=datetime.today().date().isoformat())
+            return datetime.fromisoformat(eta_iso)
     return None
 
 def is_delayed(pf, data_date):
@@ -1061,6 +1282,7 @@ def is_delayed(pf, data_date):
         return False, datetime.now()
     if 'normal_eta' in PRICING_FEEDS[pf]:
         if get_normal_eta(pf) < datetime.now():
+            logging.info(f'ETA: {get_normal_eta(pf)}, now: {datetime.now()}')
             return True, datetime.now()
     return False, datetime.now()
 
@@ -1267,8 +1489,18 @@ def prices_to_tab_delim_files(prices):
             pxs.to_csv(path_or_buf=full_path, sep='\t', header=False, index=False)
             pxs['from_date'] = from_date
             changed_prices = changed_prices + pxs.to_dict('records')
-            files.append(full_path)
-    return today_folder, files, changed_prices
+            files.append(linux2windows_filepath(full_path))
+    return linux2windows_filepath(today_folder), files, changed_prices
+
+def linux2windows_filepath(linux_path, linux_server='poc-pricing-1', share_folder='sambashare'):
+    """
+    """
+    windows_path = linux_path.replace('/', '\\')
+    share_index = windows_path.find(share_folder)
+    substr_after_share_folder = windows_path[(share_index + len(share_folder)):]
+    windows_path = f"\\\\{linux_server}\\{share_folder}{substr_after_share_folder}"
+    logging.info(f"linux2windows_filepath: changed {linux_path} to {windows_path}")
+    return windows_path
 
 def remove_other_price_types(px, pt):
     """
@@ -1385,25 +1617,31 @@ def get_last_update(securities=False, prices=False, positions=False, data_date=N
     Returns: datetime of most recent update.
     """
     latest = datetime(1970, 1, 1)
-    if securities:
-        sec_latest = vwSecurityTable().latest_update()
-        if sec_latest is not None:
-            if sec_latest > latest:
-                latest = sec_latest
-    if prices:
-        px_latest = vwPriceTable().latest_update(data_date=data_date)
-        if px_latest is not None:
-            if px_latest > latest:
-                latest = px_latest
-    if positions:
-        aa_latest = vwApxAppraisalTable().latest_update(data_date=data_date)
-        if aa_latest is None:
-            pos_latest = vwPositionTable().latest_update()
-            if pos_latest is not None:
-                if pos_latest > latest:
-                    latest = pos_latest
-        elif aa_latest > latest:
-            latest = aa_latest
+    return latest  # TODO: remove this
+    logging.info('Getting last update...')
+    try:
+        if securities:
+            sec_latest = vwSecurityTable().latest_update()
+            if sec_latest is not None:
+                if sec_latest > latest:
+                    latest = sec_latest
+        if prices:
+            px_latest = vwPriceTable().latest_update(data_date=data_date)
+            if px_latest is not None:
+                if px_latest > latest:
+                    latest = px_latest
+        if positions:
+            aa_latest = None # vwApxAppraisalTable().latest_update(data_date=data_date)
+            if aa_latest is None:
+                pos_latest = vwPositionTable().latest_update()
+                if pos_latest is not None:
+                    if pos_latest > latest:
+                        latest = pos_latest
+            elif aa_latest > latest:
+                latest = aa_latest
+    except Exception as e:
+        logging.exception(f'==========\n\n\n\nFound SQL Alchemy error: \n\n\n\n{e}\n\n\n\n')
+        return latest
     return latest
 
 def trigger_imex(folder, f, mode='Ama'):
@@ -1511,6 +1749,183 @@ async def trigger_imex_async(folder, f, mode='Ama'):
 
     return output, error, return_code
 
+def get_read_model_folder(read_model_name, data_date=None):
+    """
+    Retrieve the path to the folder containing JSON files for a given date.
+
+    Args:
+    - read_model_name (str): Name of the read model.
+    - data_date (optional: str in YYYYMMDD, or date or datetime): Date to retrieve read model for.
+
+    Returns:
+    - str: The path to the folder containing JSON files for the given date.
+    """
+    base_path = os.path.join('/home/testuser/sambashare/kafka', 'lw', 'pricing', 'read_models', read_model_name)
+    if data_date is None:
+        if not os.path.exists(base_path):
+            base_path_with_blank_file = os.path.join(base_path, '')
+            logging.info(f'Preparing file path {base_path_with_blank_file}...')
+            base_path = prepare_file_path(base_path_with_blank_file, rotate=False)
+        return base_path
+    if isinstance(data_date, str):
+        data_date = datetime.strptime(data_date, '%Y%m%d')
+    full_path = prepare_dated_file_path(folder_name=base_path, date=data_date, file_name='', rotate=False)
+    return full_path
+
+def get_read_model_modified_timestamp(read_model_name, file_name, data_date=None):
+    """
+    Retrieve the modified timestamp of the read model file.
+
+    Args:
+    - read_model_name (str): Name of the read model.
+    - file_name (str): Name of the file, excluding .json suffix.
+    - data_date (optional: str in YYYYMMDD, or date or datetime): Date to retrieve read model for.
+
+    Returns:
+    - datetime: modified timestamp of the read model file, or None if it DNE.
+    """
+    read_model_file = get_read_model_file(read_model_name, file_name, data_date)
+    if os.path.exists(read_model_file):
+        modified = os.path.getmtime(read_model_file)
+    else:
+        modified = None
+    return modified
+
+def get_read_model_file(read_model_name, file_name, data_date=None):
+    """
+    Retrieve the read model file path.
+
+    Args:
+    - read_model_name (str): Name of the read model.
+    - file_name (str): Name of the file, excluding .json suffix.
+    - data_date (optional: str in YYYYMMDD, or date or datetime): Date to retrieve read model for.
+
+    Returns:
+    - str: The full path including file name and extension of the read model file.
+        Note if the file DNE, this will still provide the full path.
+        This is for cases where the caller of this function wants to create the file.
+    """
+    read_model_folder = get_read_model_folder(read_model_name, data_date)
+    read_model_file = os.path.join(read_model_folder, f'{file_name}.json')
+    return read_model_file
+
+def get_read_model_content(read_model_name, file_name, data_date=None):
+    """
+    Retrieve the read model contents.
+
+    Args:
+    - read_model_name (str): Name of the read model.
+    - file_name (str): Name of the json file.
+    - data_date (optional: str in YYYYMMDD, or date or datetime): Date to retrieve read model for.
+
+    Returns:
+    - likely dict or list: The JSON content. Or None, if the file DNE.
+    """
+    read_model_file = get_read_model_file(read_model_name, file_name, data_date)
+    if not os.path.isfile(read_model_file):
+        return None
+    with open(read_model_file, 'r') as f:
+        content = json.loads(f.read())
+    return content
+
+def set_read_model_content(read_model_name, file_name, content, data_date=None):
+    """
+    Set the read model contents.
+
+    Args:
+    - read_model_name (str): Name of the read model.
+    - file_name (str): Name of the file, excluding .json suffix.
+    - content (JSON serializable, such as dict or list): Content for the file.
+    - data_date (optional: str in YYYYMMDD, or date or datetime): Date to retrieve read model for.
+
+    Returns:
+    - None. (TODO: error handling / provide return code)
+    """
+    read_model_file = get_read_model_file(read_model_name, file_name, data_date)
+    json_content = json.dumps(content, indent=4, default=str)
+    with open(read_model_file, 'w') as f:
+        logging.debug(f'writing to {json_content}...')
+        f.write(json_content)
+
+def append_read_model_content(read_model_name, file_name, content_to_append, data_date=None):
+    """
+    Append to the read model contents, or create the read model if it DNE.
+
+    Args:
+    - read_model_name (str): Name of the read model.
+    - file_name (str): Name of the file, excluding .json suffix.
+    - content_to_append (JSON serializable, such as dict or list): New content for the file.
+    - data_date (optional: str in YYYYMMDD, or date or datetime): Date to retrieve read model for.
+
+    Returns:
+    - None. (TODO: error handling / provide return code)
+    """
+    curr_content = get_read_model_content(read_model_name, file_name, data_date)
+    if curr_content is None:
+        set_read_model_content(read_model_name, file_name, [content_to_append], data_date)
+    elif isinstance(curr_content, list):
+        # TODO: do something useful if it is not a list
+        new_content = curr_content
+        new_content.append(content_to_append)
+        set_read_model_content(read_model_name, file_name, new_content, data_date)
+
+def refresh_sec_prices_read_model(lw_id, data_date):
+    sec = get_read_model_content('security', lw_id)
+    for rm in ['curr_bday_prices', 'prev_bday_price', 'chosen_price']:
+        rm_content = get_read_model_content(rm, lw_id, data_date)
+        sec[rm] = rm_content
+    set_read_model_content('security_with_prices', lw_id, sec, data_date)
+
+def is_newer(f1, f2):
+    """
+    Determines whether f1 is newer than f2.
+    """
+    f1_modified_at = os.path.getmtime(f1)
+    f2_modified_at = os.path.getmtime(f2)
+    return (f1_modified_at > f2_modified_at)
+
+def refresh_held_sec_prices_read_model(data_date, lw_ids):
+    logging.info(f'refreshing for {data_date} {lw_ids}...')
+    results = []
+    held_lw_ids = get_read_model_content('held_securities', file_name='lw_id', data_date=data_date)
+    lw_ids_to_update = [x for x in lw_ids if x in held_lw_ids]
+    # Remove the entries matching the lw_ids provided.
+    # In the below loop, those lw_ids will be appended.
+    curr = get_read_model_content('held_securities_with_prices', file_name='held', data_date=data_date)
+    if curr is None:  
+        # Above read model may not exist yet. If this is the case, we have no baseline.
+        results = []
+    else:
+        # But if it does exist... then we want to use keep the "other" lw_ids intact. Save them as follows:
+        # Clean first ... somehow there can be NoneType entries, rather than dicts:
+        curr = [x for x in curr if isinstance(x, dict)]
+        results = [x for x in curr if x['lw_id'] not in lw_ids_to_update]
+    # Need to add good thru date:
+    good_thru_date = get_next_bday(data_date)
+    # good_thru_date = datetime.strptime(good_thru_date, '%a, %d %b %Y %H:%M:%S %Z')
+    good_thru_date = datetime(good_thru_date.year, good_thru_date.month, good_thru_date.day)
+    good_thru_date = good_thru_date.isoformat()
+    for lw_id in lw_ids_to_update:
+        security_with_prices = get_read_model_content(
+            'security_with_prices', file_name=lw_id, data_date=data_date)        
+        if security_with_prices is not None:
+            # TODO: what to do if the result is None?
+            security_with_prices['good_thru_date'] = good_thru_date
+            security_with_prices['audit_trail'] = get_read_model_content(
+                'audit_trail', file_name=lw_id, data_date=data_date)
+            logging.info(f'Added audit trail for {lw_id}')
+            results.append(security_with_prices)
+    set_read_model_content('held_securities_with_prices'
+        , file_name='held', content=results, data_date=data_date)
+
+def pms_security_id_2_lw_id(pms_security_id):
+    sec = vwSecurityTable().read(pms_security_id=pms_security_id)
+    if len(sec.index):
+        return sec['lw_id'].iloc[0]
+    else:
+        return None
+
+# def add_audit_trail_read_model()
 
 def create_app(name=__name__, host='0.0.0.0', port=5000, debug=True):
     app = Flask(name)
