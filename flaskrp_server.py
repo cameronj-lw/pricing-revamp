@@ -9,6 +9,7 @@ import os
 import pandas as pd
 import socket
 import sys
+import time
 from datetime import date, datetime, timedelta
 from email.utils import parseaddr
 from email_validator import validate_email, EmailNotValidError
@@ -59,6 +60,7 @@ app = Flask(__name__)
 ma = Marshmallow(app)
 api = Api(app)
 CORS(app)
+USE_READ_MODELS = False
 
 
 @api.route('/api/pricing/notification-subscription')
@@ -96,7 +98,7 @@ class PricingNotificationSubscription(Resource):
     def get(self):
         subs = PricingNotificationSubscriptionTable().read()
         subs = subs.rename(columns=lambda x: x[3:] if 'is_email_on_' in x else x)  # Remove "is_" prefix from DB column names
-        valid_subs = flaskrp_helper.valid(subs)[['email','feed_name','email_on_pending','email_on_in_progress','email_on_complete','email_on_error','email_on_delayed']]
+        valid_subs = flaskrp_helper.not_deleted(subs)[['email','feed_name','email_on_pending','email_on_in_progress','email_on_complete','email_on_error','email_on_delayed']]
         return flaskrp_helper.clean(valid_subs)
 
     def delete(self):
@@ -131,7 +133,7 @@ class PricingNotificationSubscription(Resource):
 
     def set_valid_to_yesterday(self, email, feed_name):
         pns_table = PricingNotificationSubscriptionTable()
-        new_vals = {'valid_to_date': date.today() + timedelta(days=-1)}
+        new_vals = {'valid_to_date': date.today() + timedelta(days=-1), 'is_deleted': True}
         new_vals = flaskrp_helper.add_asof(new_vals)
         stmt = update(pns_table.table_def).\
                         where(pns_table.table_def.c.email == email).\
@@ -219,7 +221,20 @@ class HeldSecurityWithPrices(Resource):
         else:
             source = None
         curr_bday, prev_bday = get_current_bday(price_date), get_previous_bday(price_date)
-        if 'no_cache' in payload:
+        if ('use_read_models' in payload) or USE_READ_MODELS or 1==1:
+            # Check last update, and compare it to timestamp of the "held securities with prices" read model.
+            # If the read model has not been updated since the last update in the DB, it may be stale.
+            # If so, we should query the DB rather than use the read model:
+            # last_update_ts = flaskrp_helper.get_last_update(securities=False, prices=True, positions=True, data_date=price_date)
+            # read_model_ts = flaskrp_helper.get_read_model_modified_timestamp('held_securities_with_prices', 'held', data_date=price_date)
+            # read_model_ts = datetime.fromtimestamp(read_model_ts)
+            # logging.info(f'Read model updated at {read_model_ts}, update at {last_update_ts}')
+            # if read_model_ts >= last_update_ts:
+            logging.info('Reading from read models start...')
+            res = flaskrp_helper.get_held_security_prices(curr_bday, prev_bday, sec_type, source, use_read_models=True)
+            logging.info('Reading from read models end.')
+            return res
+        elif 'no_cache' in payload:
             res = flaskrp_helper.get_held_security_prices(curr_bday, prev_bday, sec_type, source)
             api_cache_res = flaskrp_helper.cache_result(endpointurl=f'{api.base_url}api/pricing/held-security-price'
                 , request_type='POST', payload=json.dumps(payload), result_code=200, result_text=res.get_data(as_text=True)
@@ -331,9 +346,17 @@ class PriceByIMEX(Resource):
                     pt.table_def.c.source == sec['source'],
                     pt.table_def.c.lw_id == sec['lw_id']
                 )
+                logging.info('Rotating...')
                 res = pt.rotate(data_date=datetime.strptime(sec['data_dt'], '%Y-%m-%d'), extra_where=extra_where)
-                logging.debug(f'{res} rows rotated.')
+                logging.info(f'{res} rows rotated.')
+                sec.pop('apx_security_id', None)  # because this DNE in pricing table
+                sec.pop('lw_sector_tier2_name', None)  # because this DNE in pricing table
+                sec.pop('modified_by', None)  # because this DNE in pricing table
+                sec.pop('modified_at', None)  # because this DNE in pricing table
+                sec.pop('name', None)  # because this DNE in pricing table
+                logging.info(f'Bulk inserting {sec}...')
                 res = pt.bulk_insert(pd.DataFrame.from_dict([sec]))
+                logging.info(f'Bulk insert done. {res}')
                 if 'yield' in sec:
                     # Since yield is a python keyword, it does not get included in the initial bulk insert.
                     # Solution above is to update it after the fact... 
@@ -393,7 +416,7 @@ class PriceByIMEX(Resource):
             'status': 'success',
             'data': changed_prices,
             'message': f"Prices are being sent to APX."
-        }, 200
+        }, 201
 
 @api.route('/api/pricing/manual-pricing-security')
 class ManualPricingSecurity(Resource):
@@ -411,7 +434,9 @@ class ManualPricingSecurity(Resource):
                 'data': payload,
                 'message': f"lw_id must be an array"
             }, 422
-        old_rows = self.set_valid_to_yesterday()
+        # 4/28/2023: disabled below per Vervesys #4690. 
+        # Since there is now ability to delete securities in the front-end, we do not need to do a full replace.
+        # old_rows = self.set_valid_to_yesterday()
         payload = flaskrp_helper.add_valid_dates(payload)
         payload = flaskrp_helper.add_asof(payload)
         secs = pd.DataFrame.from_dict(payload)
@@ -460,8 +485,9 @@ class ManualPricingSecurity(Resource):
 
     def set_valid_to_yesterday(self, lw_ids=None):
         mps_table = PricingManualPricingSecurityTable()
-        new_vals = {'valid_to_date': date.today() + timedelta(days=-1)}
+        new_vals = {'valid_to_date': date.today() + timedelta(days=-1), 'is_deleted': True}
         new_vals = flaskrp_helper.add_asof(new_vals)
+        logging.info(new_vals)
         stmt = update(mps_table.table_def)\
                         .where(or_(
                             mps_table.table_def.c.valid_to_date == None,
@@ -495,7 +521,7 @@ class PricingAuditTrail(Resource):
                 'message': f"audit_trail must be an array"
             }, 422
         for at in payload['audit_trail']:
-            for rf in ['lw_id','source','reason','comment']:
+            for rf in ['lw_id','reason','comment', 'after']:
                 if rf not in at:
                     req_missing.append(rf)
             if len(req_missing):
@@ -507,21 +533,189 @@ class PricingAuditTrail(Resource):
                     },
                     'message': f"required field(s) missing"
                 }, 422
+            # Convert to floats, or assign as null if it cannot be converted. 
+            # This avoids errors in cases where the payload contains other chars 
+            # (e.g. a dash) to represent blank values.
+            # Also add "_before" or "_after" to match table column names.
+            for ba in ('before', 'after'):
+                if ba in at:
+                    if not isinstance(at[ba], dict):
+                        return {
+                            'status': 'error',
+                            'data': at,
+                            'message': f"audit_trail[{ba}] must be a dictionary"
+                        }, 422
+                    if 'source' in at[ba]:
+                        at[f'source_{ba}'] = at[ba]['source']
+                    for fld in ('price', 'yield', 'duration'):
+                        if fld in at[ba]:
+                            try:
+                                at[f'{fld}_{ba}'] = float(at[ba][fld])
+                            except ValueError:
+                                at[f'{fld}_{ba}'] = None
             # passed all QA for this row! Add it to the df
             at = flaskrp_helper.add_asof(at)
-            at['data_date'] = price_date
+            at['data_date'] = datetime.strptime(price_date, "%Y%m%d").date().isoformat()
             if res_audit_trail is None:
                 res_audit_trail = pd.DataFrame([at])
             else:
-                res_audit_trail = pd.concat([res_audit_trail, pd.DataFrame([at])], ignore_index=True)
+                # Rename cols to match table definition:
+                res_audit_trail = res_audit_trail.rename(columns=lambda x: x[:5]+'_bid'+x[5:] if x[:5] in ('price', 'yield') and '_bid' not in x else x)
+                at_df = pd.DataFrame([at])
+                at_df = at_df.rename(columns=lambda x: x[:5]+'_bid'+x[5:] if x[:5] in ('price', 'yield') and '_bid' not in x else x)
+                res_audit_trail = pd.concat([res_audit_trail, at_df], ignore_index=True)
             # Rename cols to match table definition:
-            res_audit_trail = res_audit_trail.rename(columns=lambda x: x+'_bid' if x in ('price', 'yield') else x)
+            res_audit_trail = res_audit_trail.rename(columns=lambda x: x[:5]+'_bid'+x[5:] if x[:5] in ('price', 'yield') and '_bid' not in x else x)
+            # Drop columns from this version which do not belong in the read model:
+            for k in ('duration_before', 'price_before', 'source_before', 'yield_before', 
+                'duration_after', 'price_after', 'source_after', 'yield_after'):
+                if k in at:
+                    at.pop(k)
+            # And add to the read model:
+            flaskrp_helper.append_read_model_content('audit_trail', at['lw_id'], at, price_date)
+            # And update the "master" read model:
+            flaskrp_helper.refresh_held_sec_prices_read_model(data_date=price_date, lw_ids=[at['lw_id']])
+        # Remove these because they are not cols in the table:
+        res_audit_trail = res_audit_trail.drop(['asofdate','asofuser','before','after'], axis=1, errors='ignore')
+        # if 'asofdate' in res_audit_trail.columns:
+        #     res_audit_trail = res_audit_trail.drop('asofdate')
+        # if 'asofuser' in res_audit_trail.columns:
+        #     res_audit_trail = res_audit_trail.drop('asofuser')
         return flaskrp_helper.save_df_to_table(res_audit_trail, PricingAuditTrailTable())
 
     def get(self, price_date):
         audit_trail = PricingAuditTrailTable().read(data_date=price_date)
         # Remove "_bid" suffix:
-        audit_trail = audit_trail.rename(columns=lambda x: x[:-4] if x[-4:] == '_bid' else x)
+        audit_trail = audit_trail.rename(columns=lambda x: x[:5]+x[9:] if x[5:9] == '_bid' else x)
+        # Remove cols which are legacy from supporting v1
+        audit_trail = audit_trail.drop(['duration', 'price', 'source', 'yield', 'record_id'], axis=1, errors='ignore')
+        # Now get the "before" and "after" columns and put them into before/after dicts:
+        for ba in ('before', 'after'):
+            for col in audit_trail:
+                logging.info(f'Checking {col} for {ba}... {col[((len(ba)+1) * -1):]}')
+                if col[((len(ba)+1) * -1):] == '_'+ba:
+                    logging.info(f'found {ba} col: {col}')
+                    if ba not in audit_trail:
+                        # audit_trail.insert(len(audit_trail.columns), ba, pd.Series(dtype=dict))
+                        audit_trail[ba] = [{} for _ in range(len(audit_trail))]
+                        # audit_trail[ba] = {}
+                    for i, row in audit_trail.iterrows():
+                        # add to before/after dict
+                        col_wo_suffix = col[:(len(col) - len(ba) - 1)]
+                        logging.info(f"setting audit_trail.at[i, ba][{col_wo_suffix}] to {row[col]}...")
+                        audit_trail.at[i, ba][col_wo_suffix] = row[col]
+                    audit_trail = audit_trail.drop([col], axis=1)
+        audit_trail['data_date'] = audit_trail['data_date'].apply(lambda x: x.isoformat())
+        audit_trail['modified_at'] = audit_trail['modified_at'].apply(lambda x: x.isoformat())
+        return flaskrp_helper.clean(audit_trail)
+
+@api.route('/api/pricing/audit-trail-v2/<string:price_date>')
+class PricingAuditTrail(Resource):
+    def post(self, price_date):
+        payload = api.payload
+        req_missing = []
+        res_audit_trail = None
+        logging.info(f"audit-trail-v2 payload: {payload}")
+        if 'audit_trail' not in payload:
+            return {
+                'status': 'error',
+                'data': payload,
+                'message': f"payload must contain audit_trail"
+            }, 422
+        if not isinstance(payload['audit_trail'], list):
+            return {
+                'status': 'error',
+                'data': payload,
+                'message': f"audit_trail must be an array"
+            }, 422
+        for at in payload['audit_trail']:
+            for rf in ['lw_id','reason','comment', 'after']:
+                if rf not in at:
+                    req_missing.append(rf)
+            if len(req_missing):
+                return {
+                    'status': 'error',
+                    'data': {
+                        'audit_trail': at,
+                        'missing fields': req_missing
+                    },
+                    'message': f"required field(s) missing"
+                }, 422
+            # Convert to floats, or assign as null if it cannot be converted. 
+            # This avoids errors in cases where the payload contains other chars 
+            # (e.g. a dash) to represent blank values.
+            # Also add "_before" or "_after" to match table column names.
+            for ba in ('before', 'after'):
+                if ba in at:
+                    if not isinstance(at[ba], dict):
+                        return {
+                            'status': 'error',
+                            'data': at,
+                            'message': f"audit_trail[{ba}] must be a dictionary"
+                        }, 422
+                    if 'source' in at[ba]:
+                        at[f'source_{ba}'] = at[ba]['source']
+                    for fld in ('price', 'yield', 'duration'):
+                        if fld in at[ba]:
+                            try:
+                                at[f'{fld}_{ba}'] = at[ba][fld] = float(at[ba][fld])
+                            except ValueError:
+                                at[f'{fld}_{ba}'] = at[ba][fld] = None
+            # passed all QA for this row! Add it to the df
+            at = flaskrp_helper.add_asof(at)
+            at['data_date'] = datetime.strptime(price_date, "%Y%m%d").date().isoformat()
+            if res_audit_trail is None:
+                res_audit_trail = pd.DataFrame([at])
+            else:
+                # Rename cols to match table definition:
+                res_audit_trail = res_audit_trail.rename(columns=lambda x: x[:5]+'_bid'+x[5:] if x[:5] in ('price', 'yield') and '_bid' not in x else x)
+                at_df = pd.DataFrame([at])
+                at_df = at_df.rename(columns=lambda x: x[:5]+'_bid'+x[5:] if x[:5] in ('price', 'yield') and '_bid' not in x else x)
+                res_audit_trail = pd.concat([res_audit_trail, at_df], ignore_index=True)
+            # Rename cols to match table definition:
+            res_audit_trail = res_audit_trail.rename(columns=lambda x: x[:5]+'_bid'+x[5:] if x[:5] in ('price', 'yield') and '_bid' not in x else x)
+            # Drop columns from this version which do not belong in the read model:
+            for k in ('duration_before', 'price_before', 'source_before', 'yield_before', 
+                'duration_after', 'price_after', 'source_after', 'yield_after'):
+                if k in at:
+                    at.pop(k)
+            # And add to the read model:
+            logging.info(f'audit-trail-v2: Appending to AT RM: {at}')
+            flaskrp_helper.append_read_model_content('audit_trail', at['lw_id'], at, price_date)
+            # And update the "master" read model:
+            flaskrp_helper.refresh_held_sec_prices_read_model(data_date=price_date, lw_ids=[at['lw_id']])
+        # Remove these because they are not cols in the table:
+        res_audit_trail = res_audit_trail.drop(['asofdate','asofuser','before','after'], axis=1, errors='ignore')
+        # if 'asofdate' in res_audit_trail.columns:
+        #     res_audit_trail = res_audit_trail.drop('asofdate')
+        # if 'asofuser' in res_audit_trail.columns:
+        #     res_audit_trail = res_audit_trail.drop('asofuser')
+        return flaskrp_helper.save_df_to_table(res_audit_trail, PricingAuditTrailTable())
+
+    def get(self, price_date):
+        audit_trail = PricingAuditTrailTable().read(data_date=price_date)
+        # Remove "_bid" suffix:
+        audit_trail = audit_trail.rename(columns=lambda x: x[:5]+x[9:] if x[5:9] == '_bid' else x)
+        # Remove cols which are legacy from supporting v1
+        audit_trail = audit_trail.drop(['duration', 'price', 'source', 'yield', 'record_id'], axis=1, errors='ignore')
+        # Now get the "before" and "after" columns and put them into before/after dicts:
+        for ba in ('before', 'after'):
+            for col in audit_trail:
+                logging.info(f'Checking {col} for {ba}... {col[((len(ba)+1) * -1):]}')
+                if col[((len(ba)+1) * -1):] == '_'+ba:
+                    logging.info(f'found {ba} col: {col}')
+                    if ba not in audit_trail:
+                        # audit_trail.insert(len(audit_trail.columns), ba, pd.Series(dtype=dict))
+                        audit_trail[ba] = [{} for _ in range(len(audit_trail))]
+                        # audit_trail[ba] = {}
+                    for i, row in audit_trail.iterrows():
+                        # add to before/after dict
+                        col_wo_suffix = col[:(len(col) - len(ba) - 1)]
+                        logging.info(f"setting audit_trail.at[i, ba][{col_wo_suffix}] to {row[col]}...")
+                        audit_trail.at[i, ba][col_wo_suffix] = row[col]
+                    audit_trail = audit_trail.drop([col], axis=1)
+        audit_trail['data_date'] = audit_trail['data_date'].apply(lambda x: x.isoformat())
+        audit_trail['modified_at'] = audit_trail['modified_at'].apply(lambda x: x.isoformat())
         return flaskrp_helper.clean(audit_trail)
 
 @api.route('/api/pricing/column-config/<string:user_id>')
@@ -566,9 +760,15 @@ class PricingColumnConfig(Resource):
         res_col_config = flaskrp_helper.add_asof(res_col_config)
         return flaskrp_helper.save_df_to_table(res_col_config, PricingColumnConfigTable())
 
-    def get(self, user_id):
+    def get(self, user_id):   
+        teams_msg = pymsteams.connectorcard("https://leithwheeler.webhook.office.com/webhookb2/4e8ff835-529a-4e47-b0c1-50a4daa5ccc4@6c6ac5c1-edbd-4cb7-b2fc-3b1721ce9fef/IncomingWebhook/03520fc26aab48058544ba7dd5ca9056/60afe48d-2282-4374-a5dc-77776c36c1fd")
+        # logging.info(f'today: {date.today()}')
+        # logging.info(f'time: {time.time()}')
+        # logging.info(f'datetime: {datetime.fromtimestamp(time.time())}')
         column_config = PricingColumnConfigTable().read(user_id=user_id)
-        valid_config = flaskrp_helper.valid(column_config)
+        # logging.info(f'config: {column_config}')
+        valid_config = flaskrp_helper.not_deleted(column_config)
+        # logging.info(f'valid config: {valid_config}')
         return flaskrp_helper.clean(valid_config)
 
     def delete(self, user_id):
@@ -588,7 +788,7 @@ class PricingColumnConfig(Resource):
 
     def set_valid_to_yesterday(self, user_id):
         pcc_table = PricingColumnConfigTable()
-        new_vals = {'valid_to_date': date.today() + timedelta(days=-1)}
+        new_vals = {'valid_to_date': date.today() + timedelta(days=-1), 'is_deleted': True}
         new_vals = flaskrp_helper.add_asof(new_vals)
         stmt = update(pcc_table.table_def).\
                         where(pcc_table.table_def.c.user_id == user_id).\
@@ -615,6 +815,19 @@ class PriceCountBySource(Resource):  # TODO_WAVE4: implement
             price_date = payload['price_date']
         else:
             price_date = date.today()
+        if ('use_read_models' in payload) or USE_READ_MODELS or 1==1:
+            # Check last update, and compare it to timestamp of the "held securities with prices" read model.
+            # If the read model has not been updated since the last update in the DB, it may be stale.
+            # If so, we should query the DB rather than use the read model:
+            last_update_ts = flaskrp_helper.get_last_update(securities=False, prices=True, positions=True, data_date=price_date)
+            read_model_ts = flaskrp_helper.get_read_model_modified_timestamp('held_securities_with_prices', 'held', data_date=price_date)
+            read_model_ts = datetime.fromtimestamp(read_model_ts)
+            logging.info(f'Read model updated at {read_model_ts}, update at {last_update_ts}')
+            if read_model_ts >= last_update_ts: 
+                logging.info('Reading from read models start...')
+                res = flaskrp_helper.get_held_sec_price_counts_by_source(price_date, sec_type, use_read_models=True)
+                logging.info('Reading from read models end.')
+                return res
         if 'no_cache' in payload:
             res = flaskrp_helper.get_held_sec_price_counts_by_source(price_date, sec_type)
             full_res = {
@@ -873,6 +1086,12 @@ class Command(BaseCommand):
                 'SQLAlchemy pool timeout - optionally override default.'
             )
         )
+        parser.add_argument(
+            '-rm', '--use_read_models', action='store_true', default=False,
+            help=(
+                'Use read models, rather than query DB.'
+            )
+        )
 
     def handle(self, *args, **kwargs):
         """
@@ -881,6 +1100,7 @@ class Command(BaseCommand):
         # flaskrp_helper.create_app()
         # app = Flask(__name__)
         # app.app_context()
+        USE_READ_MODELS = kwargs['use_read_models']
         logging.info(f'Starting local flask server on port 5000...')
         app.run(host='0.0.0.0', port=5000, debug=True)
         return EXIT_SUCCESS
